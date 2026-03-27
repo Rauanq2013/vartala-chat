@@ -3,6 +3,8 @@ import api from '../api';
 import socket from '../socket';
 import CallWindow from './CallWindow';
 import MessageContextMenu from './MessageContextMenu';
+import ReplyPreview from './ReplyPreview';
+import ForwardModal from './ForwardModal';
 
 const ChatWindow = ({ user }) => {
     const [groups, setGroups] = useState([]);
@@ -12,14 +14,24 @@ const ChatWindow = ({ user }) => {
     const [isRecording, setIsRecording] = useState(false);
     const [mediaType, setMediaType] = useState(null);
     const [showCreateGroup, setShowCreateGroup] = useState(false);
+    const [showJoinGroup, setShowJoinGroup] = useState(false);
     const [newGroupName, setNewGroupName] = useState('');
+    const [joinCode, setJoinCode] = useState('');
     const [activeCall, setActiveCall] = useState(null);
     const [incomingCall, setIncomingCall] = useState(null);
     const [contextMenu, setContextMenu] = useState(null);
     const [editingMessage, setEditingMessage] = useState(null);
+    const [replyingToMessage, setReplyingToMessage] = useState(null);
+    const [forwardingMessage, setForwardingMessage] = useState(null);
     const [showSettings, setShowSettings] = useState(false);
     const [userStatus, setUserStatus] = useState('');
+    const [userEmail, setUserEmail] = useState('');
+    const [showSettingsDropdown, setShowSettingsDropdown] = useState(false);
+    const [showStatusModal, setShowStatusModal] = useState(false);
+    const [showEmailModal, setShowEmailModal] = useState(false);
     const [showProfilePicUpload, setShowProfilePicUpload] = useState(false);
+    const [showPinnedModal, setShowPinnedModal] = useState(false);
+    const [pinnedMessages, setPinnedMessages] = useState([]);
 
     const [showAttachments, setShowAttachments] = useState(false);
     const fileInputRef = useRef(null);
@@ -44,9 +56,16 @@ const ChatWindow = ({ user }) => {
             setIncomingCall(callData);
         });
 
+        // Listen for group approval
+        socket.on('group_approved', () => {
+            fetchGroups();
+            alert("Your request to join a group was approved!");
+        });
+
         return () => {
             socket.off('receive_message');
             socket.off('call:incoming');
+            socket.off('group_approved');
         };
     }, []);
 
@@ -74,12 +93,28 @@ const ChatWindow = ({ user }) => {
             }
         };
 
+        const handleMessageDeleted = ({ messageId }) => {
+            setMessages(prev => prev.filter(m => m.id !== messageId));
+        };
+
+        const handleMessageEdited = async ({ groupId }) => {
+            if (selectedGroup && groupId === selectedGroup.id) {
+                // Re-fetch messages to get the updated content
+                const res = await api.get(`/groups/${groupId}/messages`);
+                setMessages(Array.isArray(res.data) ? res.data : []);
+            }
+        };
+
         socket.on('receive_message', handleMessage);
         socket.on('call_history_update', handleCallHistory);
+        socket.on('message_deleted', handleMessageDeleted);
+        socket.on('message_edited', handleMessageEdited);
 
         return () => {
             socket.off('receive_message', handleMessage);
             socket.off('call_history_update', handleCallHistory);
+            socket.off('message_deleted', handleMessageDeleted);
+            socket.off('message_edited', handleMessageEdited);
         };
     }, [selectedGroup]);
 
@@ -97,6 +132,32 @@ const ChatWindow = ({ user }) => {
             console.error("Failed to fetch groups");
         }
     };
+
+    const fetchPinnedMessages = async () => {
+        if (!selectedGroup) return;
+        try {
+            const res = await api.get(`/features/${selectedGroup.id}/pinned`);
+            setPinnedMessages(res.data || []);
+            setShowPinnedModal(true);
+        } catch (err) {
+            console.error("Failed to fetch pinned", err);
+            alert("Failed to fetch pinned messages");
+        }
+    };
+
+    const createGroup = async (e) => {
+        e.preventDefault();
+        if (!newGroupName.trim()) return;
+        try {
+            await api.post('/groups', { name: newGroupName });
+            setNewGroupName('');
+            setShowCreateGroup(false);
+            fetchGroups();
+        } catch (err) {
+            console.error("Failed to create group", err);
+            alert("Failed to create group");
+        }
+    };
     const joinGroup = async (group) => {
         try {
             // First check the request status
@@ -109,7 +170,7 @@ const ChatWindow = ({ user }) => {
                 socket.emit('join_group', group.id);
 
                 const res = await api.get(`/groups/${group.id}/messages`);
-                setMessages(res.data);
+                setMessages(Array.isArray(res.data) ? res.data : []);
                 scrollToBottom();
             } else if (status === 'pending') {
                 alert('Your request to join this group is pending approval from the owner.');
@@ -126,7 +187,7 @@ const ChatWindow = ({ user }) => {
                     socket.emit('join_group', group.id);
 
                     const res = await api.get(`/groups/${group.id}/messages`);
-                    setMessages(res.data);
+                    setMessages(Array.isArray(res.data) ? res.data : []);
                     scrollToBottom();
                 }
             }
@@ -153,6 +214,29 @@ const ChatWindow = ({ user }) => {
         }
     };
 
+    const handleJoinByCode = async (e) => {
+        e.preventDefault();
+        try {
+            const res = await api.post(`/groups/join/${joinCode}`);
+            if (res.data.success) {
+                if (res.data.status === 'pending') {
+                    alert('Join request sent! Waiting for approval.');
+                } else {
+                    alert('Joined group successfully!');
+                    fetchGroups();
+                    if (res.data.group) {
+                        // Optionally auto-select, but fetching groups is safer to get full list
+                    }
+                }
+                setShowJoinGroup(false);
+                setJoinCode('');
+            }
+        } catch (err) {
+            console.error("Failed to join group:", err);
+            alert(err.response?.data?.error || "Failed to join group");
+        }
+    };
+
     const scrollToBottom = () => {
         setTimeout(() => {
             messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -165,8 +249,10 @@ const ChatWindow = ({ user }) => {
             groupId: selectedGroup.id,
             userId: user.id,
             type,
-            content
+            content,
+            reply_to_message_id: replyingToMessage ? replyingToMessage.id : null
         });
+        setReplyingToMessage(null);
     };
 
     const startRecording = async (type) => {
@@ -265,12 +351,30 @@ const ChatWindow = ({ user }) => {
                     await api.post(`/messages/${message.id}/react`, { emoji: data });
                     // Refresh messages to show new reaction
                     const res = await api.get(`/groups/${selectedGroup.id}/messages`);
-                    setMessages(res.data);
+                    setMessages(Array.isArray(res.data) ? res.data : []);
                     break;
 
                 case 'edit':
                     setEditingMessage(message);
                     setInputText(message.content);
+                    break;
+
+                case 'reply':
+                    setReplyingToMessage(message);
+                    break;
+
+                case 'forward':
+                    setForwardingMessage(message);
+                    break;
+
+                case 'pin':
+                    if (message.is_pinned) {
+                        await api.delete(`/features/${selectedGroup.id}/pin/${message.id}`);
+                    } else {
+                        await api.post(`/features/${selectedGroup.id}/pin/${message.id}`);
+                    }
+                    const resPin = await api.get(`/groups/${selectedGroup.id}/messages`);
+                    setMessages(Array.isArray(resPin.data) ? resPin.data : []);
                     break;
 
                 case 'delete-all':
@@ -305,7 +409,7 @@ const ChatWindow = ({ user }) => {
                 await api.put(`/messages/${editingMessage.id}/edit`, { content: inputText });
                 // Refresh messages
                 const res = await api.get(`/groups/${selectedGroup.id}/messages`);
-                setMessages(res.data);
+                setMessages(Array.isArray(res.data) ? res.data : []);
                 setEditingMessage(null);
                 setInputText('');
                 // Notify others via socket
@@ -400,15 +504,40 @@ const ChatWindow = ({ user }) => {
         }
     };
 
-    const handleSaveSettings = async () => {
+    const handleSaveStatus = async () => {
         try {
             await api.put('/users/profile-settings', { status: userStatus });
             user.status = userStatus;
-            setShowSettings(false);
-            alert("Settings saved!");
+            setShowStatusModal(false);
+            alert("Status updated!");
         } catch (err) {
-            console.error("Failed to save settings:", err);
-            alert("Failed to save settings");
+            console.error("Failed to update status:", err);
+            alert(err.response?.data?.error || "Failed to update status");
+        }
+    };
+
+    const handleSaveEmail = async () => {
+        try {
+            await api.put('/users/profile-settings', { email: userEmail });
+            user.email = userEmail;
+            setShowEmailModal(false);
+            alert("Email updated!");
+        } catch (err) {
+            console.error("Failed to update email:", err);
+            alert(err.response?.data?.error || "Failed to update email");
+        }
+    };
+
+    const handleDeleteAccount = async () => {
+        if (confirm('Are you sure you want to delete your account? This action cannot be undone.')) {
+            try {
+                await api.delete('/users/me');
+                alert('Account deleted successfully.');
+                window.location.reload();
+            } catch (err) {
+                console.error('Failed to delete account:', err);
+                alert('Failed to delete account');
+            }
         }
     };
 
@@ -452,17 +581,77 @@ const ChatWindow = ({ user }) => {
                         )}
                         {!user.status && <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>Online</div>}
                     </div>
-                    <button
-                        onClick={() => {
-                            setUserStatus(user.status || '');
-                            setShowSettings(true);
-                        }}
-                        className="btn btn-secondary"
-                        style={{ padding: '0.25rem 0.5rem', fontSize: '0.9rem' }}
-                        title="Settings"
-                    >
-                        ⚙️
-                    </button>
+                    <div style={{ position: 'relative' }}>
+                        <button
+                            onClick={() => setShowSettingsDropdown(!showSettingsDropdown)}
+                            className="btn btn-secondary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '0.9rem' }}
+                            title="Settings"
+                        >
+                            ⚙️
+                        </button>
+                        {showSettingsDropdown && (
+                            <div style={{
+                                position: 'absolute',
+                                top: '100%',
+                                right: 0,
+                                marginTop: '0.5rem',
+                                backgroundColor: 'var(--bg-secondary)',
+                                border: '1px solid var(--bg-tertiary)',
+                                borderRadius: 'var(--radius-md)',
+                                padding: '0.5rem',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '0.5rem',
+                                boxShadow: 'var(--shadow-lg)',
+                                zIndex: 10,
+                                minWidth: '200px'
+                            }}>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => {
+                                        setUserStatus(user.status || '');
+                                        setShowStatusModal(true);
+                                        setShowSettingsDropdown(false);
+                                    }}
+                                    style={{ justifyContent: 'flex-start' }}
+                                >
+                                    Add/Update Quote
+                                </button>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => {
+                                        setUserEmail(user.email || '');
+                                        setShowEmailModal(true);
+                                        setShowSettingsDropdown(false);
+                                    }}
+                                    style={{ justifyContent: 'flex-start' }}
+                                >
+                                    Edit Email Address
+                                </button>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => {
+                                        setShowProfilePicUpload(true);
+                                        setShowSettingsDropdown(false);
+                                    }}
+                                    style={{ justifyContent: 'flex-start' }}
+                                >
+                                    Update Profile Picture
+                                </button>
+                                <button
+                                    className="btn btn-danger"
+                                    onClick={() => {
+                                        handleDeleteAccount();
+                                        setShowSettingsDropdown(false);
+                                    }}
+                                    style={{ justifyContent: 'flex-start' }}
+                                >
+                                    Delete Account
+                                </button>
+                            </div>
+                        )}
+                    </div>
                     <input
                         type="file"
                         ref={profilePicInputRef}
@@ -474,14 +663,24 @@ const ChatWindow = ({ user }) => {
 
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                     <h3 style={{ margin: 0 }}>Groups</h3>
-                    <button
-                        onClick={() => setShowCreateGroup(!showCreateGroup)}
-                        className="btn btn-primary"
-                        style={{ padding: '0.25rem 0.5rem', fontSize: '1.2rem' }}
-                        title="Create Group"
-                    >
-                        +
-                    </button>
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button
+                            onClick={() => { setShowJoinGroup(!showJoinGroup); setShowCreateGroup(false); }}
+                            className="btn btn-secondary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '1.2rem' }}
+                            title="Join by Code"
+                        >
+                            🔑
+                        </button>
+                        <button
+                            onClick={() => { setShowCreateGroup(!showCreateGroup); setShowJoinGroup(false); }}
+                            className="btn btn-primary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '1.2rem' }}
+                            title="Create Group"
+                        >
+                            +
+                        </button>
+                    </div>
                 </div>
 
                 {showCreateGroup && (
@@ -496,6 +695,22 @@ const ChatWindow = ({ user }) => {
                         <div style={{ display: 'flex', gap: '0.5rem' }}>
                             <button type="submit" className="btn btn-primary" style={{ flex: 1, padding: '0.4rem' }}>Create</button>
                             <button type="button" onClick={() => { setShowCreateGroup(false); setNewGroupName(''); }} className="btn btn-secondary" style={{ flex: 1, padding: '0.4rem' }}>Cancel</button>
+                        </div>
+                    </form>
+                )}
+
+                {showJoinGroup && (
+                    <form onSubmit={handleJoinByCode} style={{ marginBottom: '1rem' }}>
+                        <input
+                            className="input"
+                            placeholder="Invite Code"
+                            value={joinCode}
+                            onChange={(e) => setJoinCode(e.target.value)}
+                            style={{ marginBottom: '0.5rem' }}
+                        />
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                            <button type="submit" className="btn btn-primary" style={{ flex: 1, padding: '0.4rem' }}>Join</button>
+                            <button type="button" onClick={() => { setShowJoinGroup(false); setJoinCode(''); }} className="btn btn-secondary" style={{ flex: 1, padding: '0.4rem' }}>Cancel</button>
                         </div>
                     </form>
                 )}
@@ -560,8 +775,18 @@ const ChatWindow = ({ user }) => {
                 {selectedGroup ? (
                     <>
                         <div style={{ paddingBottom: '1rem', borderBottom: '1px solid var(--bg-tertiary)', marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <h3 style={{ margin: 0 }}>#{selectedGroup.name}</h3>
+                            <div>
+                                <h3 style={{ margin: 0 }}>#{selectedGroup.name}</h3>
+                                {selectedGroup.created_by === user.id && selectedGroup.invite_code && (
+                                    <div style={{ fontSize: '0.8rem', opacity: 0.7, marginTop: '0.2rem', userSelect: 'all', cursor: 'pointer' }} title="Click to copy" onClick={() => { navigator.clipboard.writeText(selectedGroup.invite_code); alert('Code copied!'); }}>
+                                        Invite Code: <span style={{ fontFamily: 'monospace', fontWeight: 'bold' }}>{selectedGroup.invite_code}</span>
+                                    </div>
+                                )}
+                            </div>
                             <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                <button onClick={fetchPinnedMessages} className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }} title="Pinned Messages">
+                                    📌 Pinned
+                                </button>
                                 <button onClick={() => startGroupCall(false)} className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }} title="Audio Call">
                                     🎤 Audio Call
                                 </button>
@@ -643,6 +868,11 @@ const ChatWindow = ({ user }) => {
                                                 <span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', opacity: 0.6 }}>
                                                     {new Date(m.created_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}
                                                 </span>
+                                                {m.is_pinned && (
+                                                    <span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', fontWeight: 'bold', color: 'var(--accent-primary)' }}>
+                                                        📌 Pinned
+                                                    </span>
+                                                )}
                                                 {m.edit_count > 0 && (
                                                     <span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', opacity: 0.6, fontStyle: 'italic' }}>
                                                         (edited)
@@ -723,6 +953,7 @@ const ChatWindow = ({ user }) => {
 
                         {/* Input Area */}
                         <div>
+                            {replyingToMessage && <ReplyPreview message={replyingToMessage} onCancel={() => setReplyingToMessage(null)} />}
                             {editingMessage && (
                                 <div style={{
                                     padding: '0.5rem',
@@ -841,6 +1072,15 @@ const ChatWindow = ({ user }) => {
                 />
             )}
 
+            {/* Forward Modal */}
+            {forwardingMessage && (
+                <ForwardModal
+                    message={forwardingMessage}
+                    onClose={() => setForwardingMessage(null)}
+                    groups={groups}
+                />
+            )}
+
             {/* Incoming Call Modal */}
             {incomingCall && (
                 <div style={{
@@ -869,51 +1109,6 @@ const ChatWindow = ({ user }) => {
                             </button>
                             <button onClick={rejectCall} className="btn btn-danger" style={{ padding: '0.75rem 2rem' }}>
                                 Decline
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Settings Modal */}
-            {showSettings && (
-                <div style={{
-                    position: 'fixed',
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                    display: 'flex',
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                    zIndex: 1000
-                }}>
-                    <div className="card animate-scale-in" style={{ padding: '2rem', maxWidth: '400px', width: '100%' }}>
-                        <h2 style={{ marginBottom: '1.5rem' }}>Profile Settings</h2>
-
-                        <div style={{ marginBottom: '1rem' }}>
-                            <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>
-                                Status / Quote
-                            </label>
-                            <input
-                                className="input"
-                                value={userStatus}
-                                onChange={(e) => setUserStatus(e.target.value)}
-                                placeholder="Enter your status or quote..."
-                                maxLength={100}
-                            />
-                            <div style={{ fontSize: '0.75rem', opacity: 0.6, marginTop: '0.25rem' }}>
-                                {userStatus.length}/100 characters
-                            </div>
-                        </div>
-
-                        <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end', marginTop: '2rem' }}>
-                            <button onClick={() => setShowSettings(false)} className="btn btn-secondary" style={{ padding: '0.75rem 1.5rem' }}>
-                                Cancel
-                            </button>
-                            <button onClick={handleSaveSettings} className="btn btn-primary" style={{ padding: '0.75rem 1.5rem' }}>
-                                Save
                             </button>
                         </div>
                     </div>
@@ -987,6 +1182,77 @@ const ChatWindow = ({ user }) => {
                     </div>
                 </div>
             )}
+
+            {showStatusModal && (
+                <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }}>
+                    <div className="card" style={{ padding: '2rem', width: '300px' }}>
+                        <h3>Update Status Quote</h3>
+                        <input className="input" value={userStatus} onChange={e => setUserStatus(e.target.value)} style={{ width: '100%', marginBottom: '1rem' }} placeholder="Enter your status..." />
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                            <button onClick={handleSaveStatus} className="btn btn-primary" style={{ flex: 1 }}>Save</button>
+                            <button onClick={() => setShowStatusModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showEmailModal && (
+                <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }}>
+                    <div className="card" style={{ padding: '2rem', width: '300px' }}>
+                        <h3>Update Email Address</h3>
+                        <input className="input" type="email" value={userEmail} onChange={e => setUserEmail(e.target.value)} style={{ width: '100%', marginBottom: '1rem' }} placeholder="new.email@example.com" />
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                            <button onClick={handleSaveEmail} className="btn btn-primary" style={{ flex: 1 }}>Save</button>
+                            <button onClick={() => setShowEmailModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Pinned Messages Modal */}
+            {showPinnedModal && (
+                <div style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: 'rgba(0,0,0,0.8)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 2000
+                }}>
+                    <div className="card animate-scale-in" style={{ padding: '2rem', maxWidth: '500px', width: '90%', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                            <h2 style={{ margin: 0 }}>📌 Pinned Messages</h2>
+                            <button onClick={() => setShowPinnedModal(false)} className="btn btn-secondary" style={{ padding: '0.2rem 0.5rem' }}>✕</button>
+                        </div>
+                        <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            {pinnedMessages.length === 0 ? (
+                                <div style={{ color: 'var(--text-secondary)', textAlign: 'center', marginTop: '2rem' }}>No pinned messages in this group.</div>
+                            ) : (
+                                pinnedMessages.map((pm, i) => (
+                                    <div key={i} style={{ backgroundColor: 'var(--bg-tertiary)', padding: '1rem', borderRadius: 'var(--radius-md)' }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', opacity: 0.8, fontSize: '0.8rem' }}>
+                                            <span style={{ fontWeight: 'bold' }}>{pm.full_name || pm.username}</span>
+                                            <span>{new Date(pm.created_at).toLocaleString()}</span>
+                                        </div>
+                                        <div>
+                                            {pm.type === 'text' && pm.content}
+                                            {pm.type === 'image' && <img src={pm.content} alt="Image" style={{ maxWidth: '100%', borderRadius: 'var(--radius-sm)' }} />}
+                                            {pm.type === 'video' && <video src={pm.content} controls style={{ maxWidth: '100%', borderRadius: 'var(--radius-sm)' }} />}
+                                            {pm.type === 'audio' && <audio src={pm.content} controls />}
+                                            {pm.type === 'file' && <a href={pm.content} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-primary)' }}>{pm.filename || 'View File'}</a>}
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
         </div>
     );
 };

@@ -38,6 +38,20 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
         };
     }, []);
 
+    useEffect(() => {
+        import('../socket').then(({ default: socket }) => {
+            const handleEnded = () => {
+                onEnd();
+            };
+            socket.on('call:ended', handleEnded);
+            
+            // Clean up
+            return () => {
+                socket.off('call:ended', handleEnded);
+            };
+        });
+    }, [onEnd]);
+
     const handleToggleAudio = () => {
         const enabled = toggleAudio();
         setIsAudioEnabled(enabled);

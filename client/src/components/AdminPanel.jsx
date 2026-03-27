@@ -59,6 +59,33 @@ const AdminPanel = () => {
         }
     };
 
+    const deleteUser = async (id) => {
+        if (!window.confirm('Are you sure you want to delete this user?')) return;
+        try {
+            await api.delete(`/auth/users/${id}`);
+            fetchData();
+        } catch (err) {
+            console.error("Failed to delete user", err);
+            setMessage(err.response?.data?.error || 'Failed to delete user');
+        }
+    };
+
+    const resetPassword = async (id, username) => {
+        const newPassword = window.prompt(`Enter a new password for "${username}" (min 6 characters):`);
+        if (!newPassword) return;
+        if (newPassword.length < 6) {
+            alert('Password must be at least 6 characters.');
+            return;
+        }
+        try {
+            await api.put(`/auth/users/${id}/reset-password`, { newPassword });
+            setMessage(`Password for "${username}" has been reset successfully.`);
+        } catch (err) {
+            console.error('Failed to reset password', err);
+            setMessage(err.response?.data?.error || 'Failed to reset password');
+        }
+    };
+
     return (
         <div className="card animate-fade-in" style={{ height: '100%', overflowY: 'auto' }}>
             <h2 style={{ marginBottom: '1.5rem' }}>Admin Dashboard</h2>
@@ -92,8 +119,14 @@ const AdminPanel = () => {
                     <h4 style={{ marginTop: '1.5rem' }}>Existing Users</h4>
                     <ul style={{ listStyle: 'none', padding: 0 }}>
                         {users.map(u => (
-                            <li key={u.id} style={{ padding: '0.5rem 0', borderBottom: '1px solid var(--bg-tertiary)' }}>
-                                {u.username} {u.is_admin ? '(Admin)' : ''}
+                            <li key={u.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem 0', borderBottom: '1px solid var(--bg-tertiary)' }}>
+                                <span>{u.username} {u.is_admin ? '(Admin)' : ''}</span>
+                                {!u.is_admin && (
+                                    <div style={{ display: 'flex', gap: '0.4rem' }}>
+                                        <button onClick={() => resetPassword(u.id, u.username)} className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Reset Password</button>
+                                        <button onClick={() => deleteUser(u.id)} className="btn btn-danger" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Delete</button>
+                                    </div>
+                                )}
                             </li>
                         ))}
                     </ul>

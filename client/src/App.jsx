@@ -77,7 +77,7 @@ function App() {
                         }}>
                             <h1 style={{ margin: 0, fontSize: '1.25rem', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>Vartala</h1>
                             <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                                <span>{user.username} {user.is_admin && <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--accent-primary)', padding: '0.1rem 0.4rem', borderRadius: '1rem' }}>Admin</span>}</span>
+                                <span>{user.full_name || user.username} {user.is_admin === 1 && <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--accent-primary)', padding: '0.1rem 0.4rem', borderRadius: '1rem' }}>Admin</span>}</span>
                                 <button onClick={() => navigate('/')} className="btn btn-secondary">Chat</button>
                                 <button onClick={() => navigate('/requests')} className="btn btn-secondary">Join Requests</button>
                                 {user.is_admin && <button onClick={() => navigate('/admin')} className="btn btn-secondary">Admin Dashboard</button>}

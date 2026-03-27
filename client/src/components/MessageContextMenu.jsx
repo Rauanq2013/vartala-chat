@@ -83,6 +83,33 @@ const MessageContextMenu = ({ message, position, onClose, onAction, isOwnMessage
                         onClick={() => setShowEmojiPicker(true)}
                     />
 
+                    <MenuItem
+                        icon="↩️"
+                        label="Reply"
+                        onClick={() => {
+                            onAction('reply');
+                            onClose();
+                        }}
+                    />
+
+                    <MenuItem
+                        icon="↗️"
+                        label="Forward"
+                        onClick={() => {
+                            onAction('forward');
+                            onClose();
+                        }}
+                    />
+
+                    <MenuItem
+                        icon="📌"
+                        label="Pin"
+                        onClick={() => {
+                            onAction('pin');
+                            onClose();
+                        }}
+                    />
+
                     {isOwnMessage && message.type === 'text' && message.edit_count < 5 && (
                         <MenuItem
                             icon="✏️"

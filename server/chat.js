@@ -1,4 +1,4 @@
-const { prepare, saveDb } = require('./database');
+const { query, getRow, getAllRows, run } = require('./database');
 
 module.exports = (io, socket) => {
     // Join a group room
@@ -13,19 +13,27 @@ module.exports = (io, socket) => {
     });
 
     // Send Message
-    socket.on('send_message', (data) => {
-        // data: { groupId, userId, type, content }
+    socket.on('send_message', async (data) => {
         const { groupId, userId, type, content } = data;
-
         try {
-            // Save to DB
-            const result = prepare(`
-                INSERT INTO messages (group_id, user_id, type, content, filename, filesize) 
-                VALUES (?, ?, ?, ?, ?, ?)
-            `).run(groupId, userId, type, content, data.filename || null, data.filesize || null);
+            const result = await run(`
+                INSERT INTO messages (group_id, user_id, type, content, filename, filesize, reply_to_message_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+            `, [groupId, userId, type, content, data.filename || null, data.filesize || null, data.reply_to_message_id || null]);
 
-            // Get username and full_name for the broadcast
-            const user = prepare('SELECT username, full_name, profile_pic FROM users WHERE id = ?').get(userId);
+            const user = await getRow('SELECT username, full_name, profile_pic FROM users WHERE id = $1', [userId]);
+
+            let replyTo = null;
+            if (data.reply_to_message_id) {
+                const repliedMsg = await getRow(`
+                    SELECT m.id, m.content, u.username, u.full_name
+                    FROM messages m JOIN users u ON m.user_id = u.id
+                    WHERE m.id = $1
+                `, [data.reply_to_message_id]);
+                if (repliedMsg) {
+                    replyTo = { id: repliedMsg.id, content: repliedMsg.content, username: repliedMsg.username, full_name: repliedMsg.full_name };
+                }
+            }
 
             const messagePayload = {
                 id: result.lastInsertRowid,
@@ -38,158 +46,151 @@ module.exports = (io, socket) => {
                 content,
                 filename: data.filename || null,
                 filesize: data.filesize || null,
+                reply_to: replyTo,
                 created_at: new Date().toISOString()
             };
 
-            // Broadcast to room
             io.to(`group_${groupId}`).emit('receive_message', messagePayload);
         } catch (err) {
-            console.error("Error saving message:", err);
-            socket.emit('error', { message: "Failed to send message" });
+            console.error('Error saving message:', err);
+            socket.emit('error', { message: 'Failed to send message' });
         }
     });
 
-    // WebRTC Call Signaling
-    // Initiate a call (1-on-1 or group)
-    socket.on('call:initiate', ({ callId, targetUserId, groupId, isVideo }) => {
-        const room = groupId ? `group_${groupId}` : `user_${targetUserId}`;
-        socket.join(`call_${callId}`);
+    // Handle message deletion (broadcast to group)
+    socket.on('message_deleted', ({ messageId, groupId }) => {
+        socket.to(`group_${groupId}`).emit('message_deleted', { messageId, groupId });
+    });
 
-        // Save call record to database
+    // Handle message edit (broadcast to group)
+    socket.on('message_edited', ({ messageId, groupId }) => {
+        socket.to(`group_${groupId}`).emit('message_edited', { messageId, groupId });
+    });
+
+    // Typing indicators
+    socket.on('typing_start', ({ groupId, userId, username }) => {
+        socket.to(`group_${groupId}`).emit('user_typing', { userId, username });
+    });
+
+    socket.on('typing_stop', ({ groupId, userId }) => {
+        socket.to(`group_${groupId}`).emit('user_stop_typing', { userId });
+    });
+
+    // Read receipts
+    socket.on('message_read', async ({ messageId, userId, groupId }) => {
         try {
-            const result = prepare(`
-                INSERT INTO call_history (group_id, caller_id, call_type, started_at, participants)
-                VALUES (?, ?, ?, ?, ?)
-            `).run(
-                groupId || null,
-                socket.userId,
-                isVideo ? 'video' : 'audio',
-                new Date().toISOString(),
-                JSON.stringify([socket.userId])
-            );
-
-            // Store call history ID in socket for later update
-            socket.callHistoryId = result.lastInsertRowid;
+            await query(`
+                INSERT INTO message_read_status (message_id, user_id, read_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (message_id, user_id) DO NOTHING
+            `, [messageId, userId]);
+            socket.to(`group_${groupId}`).emit('message_read_update', { messageId, userId });
         } catch (err) {
-            console.error("Error saving call history:", err);
-        }
-
-        const callData = {
-            callId,
-            callerId: socket.userId,
-            callerName: socket.username,
-            isVideo,
-            groupId,
-            targetUserId
-        };
-
-        if (groupId) {
-            // Group call - notify all members in the group
-            socket.to(`group_${groupId}`).emit('call:incoming', callData);
-        } else {
-            // Private call - notify specific user
-            io.to(`user_${targetUserId}`).emit('call:incoming', callData);
+            console.error('Error saving read status:', err);
         }
     });
 
-    // Join an ongoing call
+    // Online status
+    socket.on('user_online', async ({ userId }) => {
+        try {
+            await query('UPDATE users SET is_online = TRUE, last_seen_at = NOW() WHERE id = $1', [userId]);
+            socket.broadcast.emit('user_status_change', { userId, isOnline: true });
+        } catch (err) {
+            console.error('Error updating online status:', err);
+        }
+    });
+
+    socket.on('user_offline', async ({ userId }) => {
+        try {
+            await query('UPDATE users SET is_online = FALSE, last_seen_at = NOW() WHERE id = $1', [userId]);
+            socket.broadcast.emit('user_status_change', { userId, isOnline: false });
+        } catch (err) {
+            console.error('Error updating offline status:', err);
+        }
+    });
+
+    socket.on('disconnect', async () => {
+        if (socket.userId) {
+            try {
+                await query('UPDATE users SET is_online = FALSE, last_seen_at = NOW() WHERE id = $1', [socket.userId]);
+                socket.broadcast.emit('user_status_change', { userId: socket.userId, isOnline: false });
+            } catch (err) {
+                console.error('Error on disconnect:', err);
+            }
+        }
+    });
+
+    // WebRTC Signaling
+    socket.on('call:initiate', async ({ callId, groupId, isVideo }) => {
+        try {
+            const result = await run(`
+                INSERT INTO call_history (group_id, caller_id, call_type)
+                VALUES ($1, $2, $3) RETURNING id
+            `, [groupId, socket.userId, isVideo ? 'video' : 'audio']);
+
+            socket.callHistoryId = result.lastInsertRowid;
+            socket.callGroupId = groupId;
+
+            const caller = await getRow('SELECT full_name, username FROM users WHERE id = $1', [socket.userId]);
+            socket.to(`group_${groupId}`).emit('call:incoming', {
+                callId,
+                groupId,
+                isVideo,
+                callerName: caller?.full_name || caller?.username || 'Unknown',
+                callerId: socket.userId
+            });
+        } catch (err) {
+            console.error('Error initiating call:', err);
+        }
+    });
+
     socket.on('call:join', ({ callId }) => {
         socket.join(`call_${callId}`);
-        // Notify others in the call
-        socket.to(`call_${callId}`).emit('call:user-joined', {
-            userId: socket.userId,
-            username: socket.username,
-            socketId: socket.id
-        });
+        socket.to(`call_${callId}`).emit('call:peer_joined', { peerId: socket.id, userId: socket.userId });
     });
 
-    // WebRTC Offer
-    socket.on('call:offer', ({ callId, targetSocketId, offer }) => {
-        io.to(targetSocketId).emit('call:offer', {
-            callId,
-            offer,
-            fromSocketId: socket.id,
-            fromUserId: socket.userId,
-            fromUsername: socket.username
-        });
+    socket.on('call:offer', ({ callId, offer, targetSocketId }) => {
+        io.to(targetSocketId).emit('call:offer', { offer, fromSocketId: socket.id });
     });
 
-    // WebRTC Answer
-    socket.on('call:answer', ({ callId, targetSocketId, answer }) => {
-        io.to(targetSocketId).emit('call:answer', {
-            callId,
-            answer,
-            fromSocketId: socket.id
-        });
+    socket.on('call:answer', ({ callId, answer, targetSocketId }) => {
+        io.to(targetSocketId).emit('call:answer', { answer, fromSocketId: socket.id });
     });
 
-    // ICE Candidate
-    socket.on('call:ice-candidate', ({ callId, targetSocketId, candidate }) => {
-        io.to(targetSocketId).emit('call:ice-candidate', {
-            callId,
-            candidate,
-            fromSocketId: socket.id
-        });
+    socket.on('call:ice_candidate', ({ callId, candidate, targetSocketId }) => {
+        io.to(targetSocketId).emit('call:ice_candidate', { candidate, fromSocketId: socket.id });
     });
 
-    // End call
-    socket.on('call:end', ({ callId }) => {
-        // Update call history with end time and duration
-        if (socket.callHistoryId) {
-            try {
-                const callRecord = prepare('SELECT started_at FROM call_history WHERE id = ?').get(socket.callHistoryId);
-                if (callRecord) {
-                    const startTime = new Date(callRecord.started_at);
-                    const endTime = new Date();
-                    const duration = Math.floor((endTime - startTime) / 1000); // Duration in seconds
+    socket.on('call:end', async ({ callId, groupId }) => {
+        try {
+            const endedAt = new Date();
+            if (socket.callHistoryId) {
+                const startResult = await getRow('SELECT started_at FROM call_history WHERE id = $1', [socket.callHistoryId]);
+                if (startResult) {
+                    const duration = Math.floor((endedAt - new Date(startResult.started_at)) / 1000);
+                    await query('UPDATE call_history SET ended_at = NOW(), duration = $1 WHERE id = $2', [duration, socket.callHistoryId]);
 
-                    prepare(`
-                        UPDATE call_history 
-                        SET ended_at = ?, duration = ?
-                        WHERE id = ?
-                    `).run(endTime.toISOString(), duration, socket.callHistoryId);
-
-                    // Broadcast call history update to group
-                    const updatedCall = prepare(`
-                        SELECT ch.*, u.username, u.full_name 
+                    const callRecord = await getRow(`
+                        SELECT ch.*, u.username, u.full_name
                         FROM call_history ch
                         JOIN users u ON ch.caller_id = u.id
-                        WHERE ch.id = ?
-                    `).get(socket.callHistoryId);
+                        WHERE ch.id = $1
+                    `, [socket.callHistoryId]);
 
-                    if (updatedCall) {
-                        const groupId = updatedCall.group_id;
-                        if (groupId) {
-                            io.to(`group_${groupId}`).emit('call_history_update', {
-                                ...updatedCall,
-                                type: 'call_history'
-                            });
-                        }
+                    if (callRecord) {
+                        io.to(`group_${groupId}`).emit('call_history_update', {
+                            ...callRecord,
+                            type: 'call_history',
+                            category: 'call_history',
+                            created_at: callRecord.started_at
+                        });
                     }
                 }
-            } catch (err) {
-                console.error("Error updating call history:", err);
             }
+            io.to(`call_${callId}`).emit('call:ended', { callId });
+            socket.leave(`call_${callId}`);
+        } catch (err) {
+            console.error('Error ending call:', err);
         }
-
-        socket.to(`call_${callId}`).emit('call:ended', {
-            userId: socket.userId,
-            username: socket.username
-        });
-        socket.leave(`call_${callId}`);
-    });
-
-    // Handle disconnect
-    socket.on('disconnect', () => {
-        // Notify any active calls
-        const rooms = Array.from(socket.rooms);
-        rooms.forEach(room => {
-            if (room.startsWith('call_')) {
-                socket.to(room).emit('call:user-left', {
-                    userId: socket.userId,
-                    username: socket.username
-                });
-            }
-        });
     });
 };
