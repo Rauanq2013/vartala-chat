@@ -9,14 +9,28 @@ const fs = require('fs');
 const app = express();
 const server = http.createServer(app);
 
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const allowedOrigins = [
+    process.env.CLIENT_URL,
+    'https://vartala-chat.vercel.app',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+].filter(Boolean);
 
-// Middleware
-app.use(cors({
-    origin: [CLIENT_URL, 'https://vartala-chat.vercel.app', 'http://localhost:5173'],
+const corsOptions = {
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn('CORS blocked origin:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    credentials: true
-}));
+    credentials: true,
+    optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Static files for uploads
@@ -26,11 +40,7 @@ app.use('/uploads', express.static(uploadsDir));
 
 // Socket.io Setup
 const io = new Server(server, {
-    cors: {
-        origin: [CLIENT_URL, 'https://vartala-chat.vercel.app', 'http://localhost:5173'],
-        methods: ['GET', 'POST'],
-        credentials: true
-    }
+    cors: corsOptions
 });
 
 // Inject io into req
