@@ -13,7 +13,7 @@ const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 // Middleware
 app.use(cors({
-    origin: [CLIENT_URL, 'http://localhost:5173'],
+    origin: [CLIENT_URL, 'https://vartala-chat.vercel.app', 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true
 }));
@@ -27,7 +27,7 @@ app.use('/uploads', express.static(uploadsDir));
 // Socket.io Setup
 const io = new Server(server, {
     cors: {
-        origin: [CLIENT_URL, 'http://localhost:5173'],
+        origin: [CLIENT_URL, 'https://vartala-chat.vercel.app', 'http://localhost:5173'],
         methods: ['GET', 'POST'],
         credentials: true
     }
