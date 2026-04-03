@@ -9,16 +9,14 @@ const fs = require('fs');
 const app = express();
 const server = http.createServer(app);
 
-const allowedOrigins = [
-    process.env.CLIENT_URL,
-    'https://vartala-chat.vercel.app',
-    'http://localhost:5173',
-    'http://127.0.0.1:5173'
-].filter(Boolean);
-
 const corsOptions = {
     origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
+        // Allow mobile/server (no origin), specific vercel URL, or any Vercel preview URL
+        if (!origin || 
+            origin.startsWith('https://vartala-chat') || 
+            origin.includes('.vercel.app') || 
+            origin.includes('localhost:') || 
+            origin.includes('127.0.0.1:')) {
             callback(null, true);
         } else {
             console.warn('CORS blocked origin:', origin);
@@ -31,6 +29,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // Static files for uploads

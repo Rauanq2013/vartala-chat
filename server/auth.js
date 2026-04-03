@@ -30,44 +30,62 @@ const isAdmin = (req, res, next) => {
 // Login Route
 router.post('/login', async (req, res) => {
     const { username, password } = req.body;
+    console.log(`Login attempt for: ${username}`);
     try {
-        const user = await getRow('SELECT * FROM users WHERE username = $1 OR email = $2', [username, username]);
-        if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+        const lowerInput = username.toLowerCase();
+        const user = await getRow('SELECT * FROM users WHERE LOWER(username) = $1 OR LOWER(email) = $1', [lowerInput]);
+        
+        if (!user) {
+            console.log('Login failed: User not found');
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
 
         const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
+        if (!validPassword) {
+            console.log('Login failed: Password mismatch');
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
 
+        console.log('Login successful');
         const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, SECRET_KEY, { expiresIn: '24h' });
         res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, email: user.email, profile_pic: user.profile_pic, is_admin: user.is_admin } });
     } catch (err) {
-        console.error(err);
+        console.error('Login error:', err);
         res.status(500).json({ error: 'Login failed' });
     }
 });
 
 // Sign Up Route
 router.post('/signup', async (req, res) => {
-    const { fullName, email, password } = req.body;
-    const username = email.split('@')[0];
+    const { fullName, username, email, password } = req.body;
+
+    const lowerEmail = email.toLowerCase();
+
+    if (!username || username.length < 3 || !/^[a-zA-Z0-9_]+$/.test(username)) {
+        return res.status(400).json({ error: 'Username must be at least 3 characters and contain only letters, numbers, and underscores' });
+    }
 
     try {
-        const existingUser = await getRow('SELECT id FROM users WHERE username = $1 OR email = $2', [username, email]);
-        if (existingUser) return res.status(400).json({ error: 'Username or email already exists' });
+        const existingEmail = await getRow('SELECT id FROM users WHERE LOWER(email) = $1', [lowerEmail]);
+        if (existingEmail) return res.status(400).json({ error: 'Email already exists' });
+
+        const existingUsername = await getRow('SELECT id FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+        if (existingUsername) return res.status(400).json({ error: 'Username already taken' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
         const result = await run(
             'INSERT INTO users (username, email, full_name, password, is_admin) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-            [username, email, fullName, hashedPassword, 0]
+            [username, lowerEmail, fullName, hashedPassword, 0]
         );
 
-        const token = jwt.sign({ id: result.lastInsertRowid, username, is_admin: 0 }, SECRET_KEY, { expiresIn: '24h' });
+        const token = jwt.sign({ id: result.lastInsertRowid, username: username, is_admin: 0 }, SECRET_KEY, { expiresIn: '24h' });
         res.status(201).json({
             token,
-            user: { id: result.lastInsertRowid, username, full_name: fullName, email, is_admin: 0 }
+            user: { id: result.lastInsertRowid, username: username, full_name: fullName, email: lowerEmail, is_admin: 0 }
         });
     } catch (err) {
-        console.error(err);
-        res.status(400).json({ error: 'Failed to create user' });
+        console.error('Signup error:', err);
+        res.status(400).json({ error: err.message ? `Registration failed: ${err.message}` : 'Failed to create user' });
     }
 });
 
