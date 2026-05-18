@@ -13,4 +13,21 @@ api.interceptors.request.use((config) => {
     return config;
 });
 
+// Handle expired tokens globally
+api.interceptors.response.use(
+    (response) => response,
+    (error) => {
+        if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+            // Prevent redirect loop if already on login or signup
+            if (window.location.pathname !== '/login' && window.location.pathname !== '/signup') {
+                localStorage.removeItem('token');
+                localStorage.removeItem('user');
+                localStorage.removeItem('loginDate');
+                window.location.href = '/login';
+            }
+        }
+        return Promise.reject(error);
+    }
+);
+
 export default api;

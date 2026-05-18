@@ -30,6 +30,11 @@ const isAdmin = (req, res, next) => {
 // Login Route
 router.post('/login', async (req, res) => {
     const { username, password } = req.body;
+    
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username/Email and password are required' });
+    }
+    
     console.log(`Login attempt for: ${username}`);
     try {
         const lowerInput = username.toLowerCase();
@@ -59,9 +64,17 @@ router.post('/login', async (req, res) => {
 router.post('/signup', async (req, res) => {
     const { fullName, username, email, password } = req.body;
 
+    if (!fullName || !username || !email || !password) {
+        return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
     const lowerEmail = email.toLowerCase();
 
-    if (!username || username.length < 3 || !/^[a-zA-Z0-9_]+$/.test(username)) {
+    if (username.length < 3 || !/^[a-zA-Z0-9_]+$/.test(username)) {
         return res.status(400).json({ error: 'Username must be at least 3 characters and contain only letters, numbers, and underscores' });
     }
 

@@ -57,9 +57,9 @@ const Signup = ({ setUser }) => {
         setLoading(true);
         try {
             const res = await api.post('/auth/signup', {
-                fullName: formData.fullName,
-                username: formData.username,
-                email: formData.email,
+                fullName: formData.fullName.trim(),
+                username: formData.username.trim(),
+                email: formData.email.trim(),
                 password: formData.password
             });
 

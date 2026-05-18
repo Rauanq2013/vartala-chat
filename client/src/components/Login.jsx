@@ -14,7 +14,7 @@ const Login = ({ setUser }) => {
         setError('');
         setLoading(true);
         try {
-            const res = await api.post('/auth/login', { username, password });
+            const res = await api.post('/auth/login', { username: username.trim(), password });
             const today = new Date().toDateString();
 
             // Store token, user data, and login date
