@@ -1,11 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import api from '../api';
+import { supabase } from '../supabaseClient';
 
 const AdminPanel = () => {
     const [users, setUsers] = useState([]);
     const [groups, setGroups] = useState([]);
-    const [newUsername, setNewUsername] = useState('');
-    const [newPassword, setNewPassword] = useState('');
     const [newGroupName, setNewGroupName] = useState('');
     const [message, setMessage] = useState('');
 
@@ -15,32 +13,31 @@ const AdminPanel = () => {
 
     const fetchData = async () => {
         try {
-            const usersRes = await api.get('/auth/users');
-            const groupsRes = await api.get('/groups');
-            setUsers(usersRes.data);
-            setGroups(groupsRes.data);
+            const { data: usersData } = await supabase.from('users').select('*');
+            const { data: groupsData } = await supabase.from('groups').select('*');
+            setUsers(usersData || []);
+            setGroups(groupsData || []);
         } catch (err) {
-            console.error("Failed to fetch admin data", err);
-        }
-    };
-
-    const createUser = async (e) => {
-        e.preventDefault();
-        try {
-            await api.post('/auth/users', { username: newUsername, password: newPassword });
-            setMessage('User created successfully');
-            setNewUsername('');
-            setNewPassword('');
-            fetchData();
-        } catch (err) {
-            setMessage('Failed to create user');
+            console.error('Failed to fetch admin data', err);
         }
     };
 
     const createGroup = async (e) => {
         e.preventDefault();
         try {
-            await api.post('/groups', { name: newGroupName });
+            const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+            const { data: session } = await supabase.auth.getSession();
+            const { data: currentUser } = await supabase
+                .from('users')
+                .select('id')
+                .eq('auth_id', session.session.user.id)
+                .single();
+
+            await supabase.from('groups').insert({
+                name: newGroupName,
+                created_by: currentUser.id,
+                invite_code: inviteCode
+            });
             setMessage('Group created successfully');
             setNewGroupName('');
             fetchData();
@@ -52,37 +49,21 @@ const AdminPanel = () => {
     const deleteGroup = async (id) => {
         if (!window.confirm('Are you sure?')) return;
         try {
-            await api.delete(`/groups/${id}`);
+            await supabase.from('groups').delete().eq('id', id);
             fetchData();
         } catch (err) {
-            console.error("Failed to delete group");
+            console.error('Failed to delete group');
         }
     };
 
     const deleteUser = async (id) => {
         if (!window.confirm('Are you sure you want to delete this user?')) return;
         try {
-            await api.delete(`/auth/users/${id}`);
+            await supabase.from('users').delete().eq('id', id);
             fetchData();
         } catch (err) {
-            console.error("Failed to delete user", err);
-            setMessage(err.response?.data?.error || 'Failed to delete user');
-        }
-    };
-
-    const resetPassword = async (id, username) => {
-        const newPassword = window.prompt(`Enter a new password for "${username}" (min 6 characters):`);
-        if (!newPassword) return;
-        if (newPassword.length < 6) {
-            alert('Password must be at least 6 characters.');
-            return;
-        }
-        try {
-            await api.put(`/auth/users/${id}/reset-password`, { newPassword });
-            setMessage(`Password for "${username}" has been reset successfully.`);
-        } catch (err) {
-            console.error('Failed to reset password', err);
-            setMessage(err.response?.data?.error || 'Failed to reset password');
+            console.error('Failed to delete user', err);
+            setMessage('Failed to delete user');
         }
     };
 
@@ -94,28 +75,7 @@ const AdminPanel = () => {
             <div style={{ display: 'grid', gap: '2rem', gridTemplateColumns: '1fr 1fr' }}>
                 {/* User Management */}
                 <div>
-                    <h3 style={{ borderBottom: '1px solid var(--bg-tertiary)', paddingBottom: '0.5rem' }}>Create User</h3>
-                    <form onSubmit={createUser} style={{ marginTop: '1rem' }}>
-                        <div style={{ marginBottom: '0.5rem' }}>
-                            <input
-                                placeholder="Username"
-                                className="input"
-                                value={newUsername}
-                                onChange={(e) => setNewUsername(e.target.value)}
-                            />
-                        </div>
-                        <div style={{ marginBottom: '0.5rem' }}>
-                            <input
-                                placeholder="Password"
-                                type="password"
-                                className="input"
-                                value={newPassword}
-                                onChange={(e) => setNewPassword(e.target.value)}
-                            />
-                        </div>
-                        <button type="submit" className="btn btn-primary">Create User</button>
-                    </form>
-
+                    <h3 style={{ borderBottom: '1px solid var(--bg-tertiary)', paddingBottom: '0.5rem' }}>Users</h3>
                     <h4 style={{ marginTop: '1.5rem' }}>Existing Users</h4>
                     <ul style={{ listStyle: 'none', padding: 0 }}>
                         {users.map(u => (
@@ -123,7 +83,6 @@ const AdminPanel = () => {
                                 <span>{u.username} {u.is_admin ? '(Admin)' : ''}</span>
                                 {!u.is_admin && (
                                     <div style={{ display: 'flex', gap: '0.4rem' }}>
-                                        <button onClick={() => resetPassword(u.id, u.username)} className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Reset Password</button>
                                         <button onClick={() => deleteUser(u.id)} className="btn btn-danger" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Delete</button>
                                     </div>
                                 )}

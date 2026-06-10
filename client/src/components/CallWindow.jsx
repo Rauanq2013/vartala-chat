@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useWebRTC } from '../hooks/useWebRTC';
+import { supabase } from '../supabaseClient';
 
-const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants }) => {
+const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants, user }) => {
     const {
         localStream,
         remoteStreams,
@@ -11,20 +12,18 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
         toggleAudio,
         toggleVideo,
         endCall
-    } = useWebRTC(callId, true);
+    } = useWebRTC(callId, true, user);
 
     const [isAudioEnabled, setIsAudioEnabled] = useState(true);
     const [isVideoEnabled, setIsVideoEnabled] = useState(isVideo);
     const localVideoRef = useRef(null);
 
     useEffect(() => {
-        // Start the call and get local stream
         startCall(isVideo).then(stream => {
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = stream;
             }
 
-            // Create offers to all initial participants
             initialParticipants.forEach(p => {
                 createOffer(p.socketId, p.username);
             });
@@ -39,18 +38,16 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
     }, []);
 
     useEffect(() => {
-        import('../socket').then(({ default: socket }) => {
-            const handleEnded = () => {
+        const callChannel = supabase.channel(`call-ended-${callId}`)
+            .on('broadcast', { event: 'call:ended' }, () => {
                 onEnd();
-            };
-            socket.on('call:ended', handleEnded);
+            })
+            .subscribe();
             
-            // Clean up
-            return () => {
-                socket.off('call:ended', handleEnded);
-            };
-        });
-    }, [onEnd]);
+        return () => {
+            supabase.removeChannel(callChannel);
+        };
+    }, [callId, onEnd]);
 
     const handleToggleAudio = () => {
         const enabled = toggleAudio();
@@ -67,7 +64,6 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
         onEnd();
     };
 
-    // Limit displayed participants to 6 for performance
     const displayedStreams = Array.from(remoteStreams.entries()).slice(0, 6);
     const gridCols = displayedStreams.length === 1 ? 1 : displayedStreams.length <= 4 ? 2 : 3;
 
@@ -93,7 +89,7 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
                 alignItems: 'center'
             }}>
                 <h3 style={{ margin: 0 }}>
-                    {isVideo ? '📹' : '🎤'} Call - {participants.length + 1} participant{participants.length !== 0 ? 's' : ''}
+                    {isVideo ? '📹' : '🎙️'} Call - {participants.length + 1} participant{participants.length !== 0 ? 's' : ''}
                 </h3>
                 {remoteStreams.size > 6 && (
                     <span style={{ fontSize: '0.875rem', opacity: 0.7 }}>
@@ -128,7 +124,7 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
                             width: '100%',
                             height: '100%',
                             objectFit: 'cover',
-                            transform: 'scaleX(-1)' // Mirror local video
+                            transform: 'scaleX(-1)'
                         }}
                     />
                     <div style={{
@@ -174,11 +170,14 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
                         height: '60px',
                         borderRadius: '50%',
                         backgroundColor: isAudioEnabled ? 'var(--bg-tertiary)' : 'var(--danger)',
-                        fontSize: '1.5rem'
+                        fontSize: '1.5rem',
+                        border: 'none',
+                        color: 'white',
+                        cursor: 'pointer'
                     }}
                     title={isAudioEnabled ? 'Mute' : 'Unmute'}
                 >
-                    {isAudioEnabled ? '🎤' : '🔇'}
+                    {isAudioEnabled ? '🎙️' : '🔇'}
                 </button>
 
                 {isVideo && (
@@ -190,11 +189,14 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
                             height: '60px',
                             borderRadius: '50%',
                             backgroundColor: isVideoEnabled ? 'var(--bg-tertiary)' : 'var(--danger)',
-                            fontSize: '1.5rem'
+                            fontSize: '1.5rem',
+                            border: 'none',
+                            color: 'white',
+                            cursor: 'pointer'
                         }}
                         title={isVideoEnabled ? 'Turn Off Video' : 'Turn On Video'}
                     >
-                        {isVideoEnabled ? '📹' : '📵'}
+                        {isVideoEnabled ? '📹' : '🔇'}
                     </button>
                 )}
 
@@ -205,7 +207,10 @@ const CallWindow = ({ callId, isVideo, onEnd, participants: initialParticipants 
                         width: '60px',
                         height: '60px',
                         borderRadius: '50%',
-                        fontSize: '1.5rem'
+                        fontSize: '1.5rem',
+                        border: 'none',
+                        color: 'white',
+                        cursor: 'pointer'
                     }}
                     title="End Call"
                 >

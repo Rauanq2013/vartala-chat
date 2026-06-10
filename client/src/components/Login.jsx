@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import api from '../api';
+import { supabase } from '../supabaseClient';
 
 const Login = ({ setUser }) => {
     const [username, setUsername] = useState('');
@@ -14,18 +14,52 @@ const Login = ({ setUser }) => {
         setError('');
         setLoading(true);
         try {
-            const res = await api.post('/auth/login', { username: username.trim(), password });
-            const today = new Date().toDateString();
+            // First, try to login assuming the username is an email address
+            let { data, error: signInError } = await supabase.auth.signInWithPassword({
+                email: username.trim(),
+                password: password,
+            });
 
-            // Store token, user data, and login date
-            localStorage.setItem('token', res.data.token);
-            localStorage.setItem('user', JSON.stringify(res.data.user));
-            localStorage.setItem('loginDate', today);
+            // If it fails with "Invalid login credentials", check if it's a username instead
+            if (signInError && signInError.message === 'Invalid login credentials') {
+                // Find the user's email by looking up their username in the public.users table
+                const { data: userData, error: userError } = await supabase
+                    .from('users')
+                    .select('email')
+                    .ilike('username', username.trim())
+                    .single();
 
-            setUser(res.data.user);
+                if (!userError && userData && userData.email) {
+                    // Try logging in again with the found email
+                    const retry = await supabase.auth.signInWithPassword({
+                        email: userData.email,
+                        password: password,
+                    });
+                    data = retry.data;
+                    signInError = retry.error;
+                }
+            }
+
+            if (signInError) throw signInError;
+
+            // Fetch the public profile
+            const { data: profileData, error: profileError } = await supabase
+                .from('users')
+                .select('*')
+                .eq('auth_id', data.user.id)
+                .single();
+
+            if (profileError) {
+                console.error("Error fetching user profile:", profileError);
+                // Fallback to basic user info if public profile isn't ready
+                setUser({ id: data.user.id, email: data.user.email, username: username.trim(), is_admin: 0 });
+            } else {
+                setUser(profileData);
+            }
+
             navigate('/');
         } catch (err) {
-            setError(err.response?.data?.error || err.message || 'Invalid credentials');
+            setError(err.message || 'Invalid credentials');
         } finally {
             setLoading(false);
         }

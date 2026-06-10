@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import socket from '../socket';
+import { supabase } from '../supabaseClient';
 
 const ICE_SERVERS = {
     iceServers: [
@@ -8,71 +8,77 @@ const ICE_SERVERS = {
     ]
 };
 
-export const useWebRTC = (callId, isInitiator) => {
+export const useWebRTC = (callId, isInitiator, user) => {
     const [localStream, setLocalStream] = useState(null);
     const [remoteStreams, setRemoteStreams] = useState(new Map());
     const [participants, setParticipants] = useState([]);
 
     const peerConnections = useRef(new Map());
     const pendingCandidates = useRef(new Map());
+    
+    const myPeerId = useRef(Math.random().toString(36).substring(2, 9));
+    const channelRef = useRef(null);
 
-    const createPeerConnection = useCallback((socketId, username) => {
+    const createPeerConnection = useCallback((peerId, username) => {
         const pc = new RTCPeerConnection(ICE_SERVERS);
 
-        // Add local stream tracks
         if (localStream) {
             localStream.getTracks().forEach(track => {
                 pc.addTrack(track, localStream);
             });
         }
 
-        // Handle incoming tracks
         pc.ontrack = (event) => {
             setRemoteStreams(prev => {
                 const newMap = new Map(prev);
-                newMap.set(socketId, event.streams[0]);
+                newMap.set(peerId, event.streams[0]);
                 return newMap;
             });
         };
 
-        // Handle ICE candidates
         pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                socket.emit('call:ice-candidate', {
-                    callId,
-                    targetSocketId: socketId,
-                    candidate: event.candidate
+            if (event.candidate && channelRef.current) {
+                channelRef.current.send({
+                    type: 'broadcast',
+                    event: 'call:ice-candidate',
+                    payload: {
+                        targetPeerId: peerId,
+                        fromPeerId: myPeerId.current,
+                        candidate: event.candidate
+                    }
                 });
             }
         };
 
-        // Handle connection state
         pc.onconnectionstatechange = () => {
             console.log(`Connection state with ${username}:`, pc.connectionState);
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                removePeer(socketId);
+                removePeer(peerId);
             }
         };
 
-        peerConnections.current.set(socketId, pc);
-        setParticipants(prev => [...prev, { socketId, username }]);
+        peerConnections.current.set(peerId, pc);
+        setParticipants(prev => {
+            if (prev.some(p => p.socketId === peerId)) return prev;
+            return [...prev, { socketId: peerId, username }];
+        });
 
         return pc;
-    }, [callId, localStream]);
+    }, [localStream]);
 
-    const removePeer = useCallback((socketId) => {
-        const pc = peerConnections.current.get(socketId);
+    const removePeer = useCallback((peerId) => {
+        const pc = peerConnections.current.get(peerId);
         if (pc) {
             pc.close();
-            peerConnections.current.delete(socketId);
+            peerConnections.current.delete(peerId);
         }
         setRemoteStreams(prev => {
             const newMap = new Map(prev);
-            newMap.delete(socketId);
+            newMap.delete(peerId);
             return newMap;
         });
-        setParticipants(prev => prev.filter(p => p.socketId !== socketId));
-        pendingCandidates.current.delete(socketId);
+        setParticipants(prev => prev.filter(p => p.socketId !== peerId));
+        pendingCandidates.current.delete(peerId);
     }, []);
 
     const startCall = useCallback(async (isVideo = true) => {
@@ -89,62 +95,72 @@ export const useWebRTC = (callId, isInitiator) => {
         }
     }, []);
 
-    const createOffer = useCallback(async (socketId, username) => {
-        const pc = createPeerConnection(socketId, username);
+    const createOffer = useCallback(async (peerId, username) => {
+        const pc = createPeerConnection(peerId, username);
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        socket.emit('call:offer', {
-            callId,
-            targetSocketId: socketId,
-            offer
-        });
-    }, [callId, createPeerConnection]);
+        if (channelRef.current) {
+            channelRef.current.send({
+                type: 'broadcast',
+                event: 'call:offer',
+                payload: {
+                    targetPeerId: peerId,
+                    fromPeerId: myPeerId.current,
+                    fromUsername: user?.username || 'Unknown',
+                    offer
+                }
+            });
+        }
+    }, [createPeerConnection, user]);
 
-    const handleOffer = useCallback(async ({ offer, fromSocketId, fromUsername }) => {
-        const pc = createPeerConnection(fromSocketId, fromUsername);
+    const handleOffer = useCallback(async ({ offer, fromPeerId, fromUsername }) => {
+        const pc = createPeerConnection(fromPeerId, fromUsername);
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
-        // Add any pending candidates
-        const candidates = pendingCandidates.current.get(fromSocketId) || [];
+        const candidates = pendingCandidates.current.get(fromPeerId) || [];
         for (const candidate of candidates) {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
         }
-        pendingCandidates.current.delete(fromSocketId);
+        pendingCandidates.current.delete(fromPeerId);
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
-        socket.emit('call:answer', {
-            callId,
-            targetSocketId: fromSocketId,
-            answer
-        });
-    }, [callId, createPeerConnection]);
+        if (channelRef.current) {
+            channelRef.current.send({
+                type: 'broadcast',
+                event: 'call:answer',
+                payload: {
+                    targetPeerId: fromPeerId,
+                    fromPeerId: myPeerId.current,
+                    answer
+                }
+            });
+        }
+    }, [createPeerConnection]);
 
-    const handleAnswer = useCallback(async ({ answer, fromSocketId }) => {
-        const pc = peerConnections.current.get(fromSocketId);
+    const handleAnswer = useCallback(async ({ answer, fromPeerId }) => {
+        const pc = peerConnections.current.get(fromPeerId);
         if (pc) {
             await pc.setRemoteDescription(new RTCSessionDescription(answer));
 
-            // Add any pending candidates
-            const candidates = pendingCandidates.current.get(fromSocketId) || [];
+            const candidates = pendingCandidates.current.get(fromPeerId) || [];
             for (const candidate of candidates) {
                 await pc.addIceCandidate(new RTCIceCandidate(candidate));
             }
-            pendingCandidates.current.delete(fromSocketId);
+            pendingCandidates.current.delete(fromPeerId);
         }
     }, []);
 
-    const handleIceCandidate = useCallback(async ({ candidate, fromSocketId }) => {
-        const pc = peerConnections.current.get(fromSocketId);
+    const handleIceCandidate = useCallback(async ({ candidate, fromPeerId }) => {
+        const pc = peerConnections.current.get(fromPeerId);
         if (pc && pc.remoteDescription) {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } else {
-            // Store candidate for later
-            const candidates = pendingCandidates.current.get(fromSocketId) || [];
+            const candidates = pendingCandidates.current.get(fromPeerId) || [];
             candidates.push(candidate);
-            pendingCandidates.current.set(fromSocketId, candidates);
+            pendingCandidates.current.set(fromPeerId, candidates);
         }
     }, []);
 
@@ -171,13 +187,11 @@ export const useWebRTC = (callId, isInitiator) => {
     }, [localStream]);
 
     const endCall = useCallback(() => {
-        // Stop local stream
         if (localStream) {
             localStream.getTracks().forEach(track => track.stop());
             setLocalStream(null);
         }
 
-        // Close all peer connections
         peerConnections.current.forEach(pc => pc.close());
         peerConnections.current.clear();
 
@@ -185,25 +199,73 @@ export const useWebRTC = (callId, isInitiator) => {
         setParticipants([]);
         pendingCandidates.current.clear();
 
-        socket.emit('call:end', { callId });
+        if (channelRef.current) {
+            channelRef.current.send({
+                type: 'broadcast',
+                event: 'call:ended',
+                payload: { callId }
+            });
+        }
     }, [callId, localStream]);
 
     useEffect(() => {
-        socket.on('call:offer', handleOffer);
-        socket.on('call:answer', handleAnswer);
-        socket.on('call:ice-candidate', handleIceCandidate);
-        socket.on('call:user-left', ({ userId }) => {
-            // Find and remove peer by userId (we'd need to track this mapping)
-            // For now, this is a simplified version
+        if (!localStream) return;
+
+        const channel = supabase.channel(`call-${callId}`);
+        channelRef.current = channel;
+
+        channel
+            .on('broadcast', { event: 'call:peer_joined' }, (payload) => {
+                const { peerId, username } = payload.payload;
+                createOffer(peerId, username);
+            })
+            .on('broadcast', { event: 'call:offer' }, (payload) => {
+                const { offer, targetPeerId, fromPeerId, fromUsername } = payload.payload;
+                if (targetPeerId === myPeerId.current) {
+                    handleOffer({ offer, fromPeerId, fromUsername });
+                }
+            })
+            .on('broadcast', { event: 'call:answer' }, (payload) => {
+                const { answer, targetPeerId, fromPeerId } = payload.payload;
+                if (targetPeerId === myPeerId.current) {
+                    handleAnswer({ answer, fromPeerId });
+                }
+            })
+            .on('broadcast', { event: 'call:ice-candidate' }, (payload) => {
+                const { candidate, targetPeerId, fromPeerId } = payload.payload;
+                if (targetPeerId === myPeerId.current) {
+                    handleIceCandidate({ candidate, fromPeerId });
+                }
+            })
+            .on('broadcast', { event: 'call:user-left' }, (payload) => {
+                const { peerId } = payload.payload;
+                removePeer(peerId);
+            });
+
+        channel.subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+                channel.send({
+                    type: 'broadcast',
+                    event: 'call:peer_joined',
+                    payload: {
+                        peerId: myPeerId.current,
+                        username: user?.username || 'Unknown'
+                    }
+                });
+            }
         });
 
         return () => {
-            socket.off('call:offer', handleOffer);
-            socket.off('call:answer', handleAnswer);
-            socket.off('call:ice-candidate', handleIceCandidate);
-            socket.off('call:user-left');
+            if (channelRef.current) {
+                channelRef.current.send({
+                    type: 'broadcast',
+                    event: 'call:user-left',
+                    payload: { peerId: myPeerId.current }
+                });
+            }
+            supabase.removeChannel(channel);
         };
-    }, [handleOffer, handleAnswer, handleIceCandidate]);
+    }, [callId, localStream, createOffer, handleOffer, handleAnswer, handleIceCandidate, removePeer, user]);
 
     return {
         localStream,

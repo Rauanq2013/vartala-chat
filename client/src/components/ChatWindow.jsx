@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import api from '../api';
-import socket from '../socket';
+import { supabase } from '../supabaseClient';
 import CallWindow from './CallWindow';
 import MessageContextMenu from './MessageContextMenu';
 import ReplyPreview from './ReplyPreview';
@@ -45,76 +44,132 @@ const ChatWindow = ({ user }) => {
     useEffect(() => {
         fetchGroups();
 
-        const token = localStorage.getItem('token');
-        if (token) {
-            socket.auth = { token };
-            socket.connect();
-        }
-
-        // Listen for incoming calls
-        socket.on('call:incoming', (callData) => {
-            setIncomingCall(callData);
-        });
-
-        // Listen for group approval
-        socket.on('group_approved', () => {
-            fetchGroups();
-            alert("Your request to join a group was approved!");
-        });
+        // Listen for incoming calls on Realtime Broadcast
+        const callChannel = supabase.channel('calls')
+            .on('broadcast', { event: 'call:incoming' }, (payload) => {
+                setIncomingCall(payload.payload);
+            })
+            .subscribe();
 
         return () => {
-            socket.off('receive_message');
-            socket.off('call:incoming');
-            socket.off('group_approved');
+            supabase.removeChannel(callChannel);
         };
     }, []);
 
+    const fetchMessages = async (groupId) => {
+        try {
+            // 1. Fetch messages with relations joined
+            const { data: messagesData, error: messagesError } = await supabase
+                .from('messages')
+                .select(`
+                    *,
+                    users(username, full_name, profile_pic),
+                    message_reactions(emoji, user_id),
+                    pinned_messages(id),
+                    deleted_messages(deleted_for_all, user_id),
+                    reply_to:messages!reply_to_message_id(id, content, users(username, full_name))
+                `)
+                .eq('group_id', groupId)
+                .order('created_at', { ascending: true });
+
+            if (messagesError) throw messagesError;
+
+            // 2. Fetch call history for group
+            const { data: callHistoryData, error: callError } = await supabase
+                .from('call_history')
+                .select('*, users!caller_id(username, full_name)')
+                .eq('group_id', groupId)
+                .order('started_at', { ascending: true });
+
+            if (callError) throw callError;
+
+            // Format messages
+            const formattedMessages = (messagesData || []).map(m => {
+                const rawReactions = m.message_reactions || [];
+                const grouped = rawReactions.reduce((acc, r) => {
+                    acc[r.emoji] = (acc[r.emoji] || 0) + 1;
+                    return acc;
+                }, {});
+                const reactions = Object.entries(grouped).map(([emoji, count]) => ({ emoji, count }));
+
+                const isDeleted = (m.deleted_messages || []).some(dm => dm.deleted_for_all || dm.user_id === user.id);
+                const isPinned = (m.pinned_messages || []).length > 0;
+
+                return {
+                    ...m,
+                    username: m.users?.username,
+                    full_name: m.users?.full_name,
+                    profile_pic: m.users?.profile_pic,
+                    reactions,
+                    is_deleted: isDeleted,
+                    is_pinned: isPinned,
+                    reply_to: m.reply_to ? {
+                        id: m.reply_to.id,
+                        content: m.reply_to.content,
+                        username: m.reply_to.users?.username,
+                        full_name: m.reply_to.users?.full_name
+                    } : null,
+                    category: 'message'
+                };
+            });
+
+            // Format calls
+            const formattedCalls = (callHistoryData || []).map(ch => ({
+                ...ch,
+                username: ch.users?.username,
+                full_name: ch.users?.full_name,
+                category: 'call_history',
+                created_at: ch.started_at
+            }));
+
+            // Merge and sort timeline
+            const timeline = [...formattedMessages, ...formattedCalls].sort((a, b) =>
+                new Date(a.created_at) - new Date(b.created_at)
+            );
+
+            setMessages(timeline);
+            scrollToBottom();
+        } catch (err) {
+            console.error("Failed to fetch messages:", err);
+        }
+    };
+
     useEffect(() => {
-        const handleMessage = (message) => {
-            if (selectedGroup && message.group_id === selectedGroup.id) {
-                setMessages((prev) => [...prev, message]);
-                scrollToBottom();
-            }
-        };
+        if (!selectedGroup) return;
 
-        const handleCallHistory = (callRecord) => {
-            if (selectedGroup && callRecord.group_id === selectedGroup.id) {
-                setMessages((prev) => {
-                    // Check if this call history already exists
-                    const exists = prev.some(m =>
-                        m.type === 'call_history' && m.id === callRecord.id
-                    );
-                    if (exists) {
-                        return prev;
-                    }
-                    return [...prev, callRecord];
-                });
-                scrollToBottom();
-            }
-        };
+        fetchMessages(selectedGroup.id);
 
-        const handleMessageDeleted = ({ messageId }) => {
-            setMessages(prev => prev.filter(m => m.id !== messageId));
-        };
-
-        const handleMessageEdited = async ({ groupId }) => {
-            if (selectedGroup && groupId === selectedGroup.id) {
-                // Re-fetch messages to get the updated content
-                const res = await api.get(`/groups/${groupId}/messages`);
-                setMessages(Array.isArray(res.data) ? res.data : []);
-            }
-        };
-
-        socket.on('receive_message', handleMessage);
-        socket.on('call_history_update', handleCallHistory);
-        socket.on('message_deleted', handleMessageDeleted);
-        socket.on('message_edited', handleMessageEdited);
+        // Subscribe to Postgres changes on messages and related tables for realtime updates
+        const channel = supabase.channel(`group-chat-${selectedGroup.id}`)
+            .on(
+                'postgres_changes',
+                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'messages' },
+                () => { fetchMessages(selectedGroup.id); }
+            )
+            .on(
+                'postgres_changes',
+                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'pinned_messages' },
+                () => { fetchMessages(selectedGroup.id); }
+            )
+            .on(
+                'postgres_changes',
+                { event: '*', schema: 'public', table: 'deleted_messages' },
+                () => { fetchMessages(selectedGroup.id); }
+            )
+            .on(
+                'postgres_changes',
+                { event: '*', schema: 'public', table: 'message_reactions' },
+                () => { fetchMessages(selectedGroup.id); }
+            )
+            .on(
+                'postgres_changes',
+                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'call_history' },
+                () => { fetchMessages(selectedGroup.id); }
+            )
+            .subscribe();
 
         return () => {
-            socket.off('receive_message', handleMessage);
-            socket.off('call_history_update', handleCallHistory);
-            socket.off('message_deleted', handleMessageDeleted);
-            socket.off('message_edited', handleMessageEdited);
+            supabase.removeChannel(channel);
         };
     }, [selectedGroup]);
 
@@ -126,18 +181,52 @@ const ChatWindow = ({ user }) => {
 
     const fetchGroups = async () => {
         try {
-            const res = await api.get('/groups');
-            setGroups(res.data);
+            // Get groups the user is a member of
+            const { data: memberRows, error: memberError } = await supabase
+                .from('group_members')
+                .select('group_id')
+                .eq('user_id', user.id);
+
+            if (memberError) throw memberError;
+            const groupIds = (memberRows || []).map(m => m.group_id);
+
+            let query = supabase.from('groups').select('*');
+            if (groupIds.length > 0) {
+                query = query.or(`created_by.eq.${user.id},id.in.(${groupIds.join(',')})`);
+            } else {
+                query = query.eq('created_by', user.id);
+            }
+
+            const { data, error } = await query;
+            if (error) throw error;
+
+            setGroups(data || []);
         } catch (err) {
-            console.error("Failed to fetch groups");
+            console.error("Failed to fetch groups:", err);
         }
     };
 
     const fetchPinnedMessages = async () => {
         if (!selectedGroup) return;
         try {
-            const res = await api.get(`/features/${selectedGroup.id}/pinned`);
-            setPinnedMessages(res.data || []);
+            const { data, error } = await supabase
+                .from('pinned_messages')
+                .select('*, messages(*, users(username, full_name))')
+                .eq('group_id', selectedGroup.id);
+
+            if (error) throw error;
+
+            const formatted = (data || [])
+                .filter(pm => pm.messages)
+                .map(pm => ({
+                    ...pm.messages,
+                    username: pm.messages.users?.username,
+                    full_name: pm.messages.users?.full_name,
+                    category: 'message',
+                    is_pinned: true
+                }));
+
+            setPinnedMessages(formatted);
             setShowPinnedModal(true);
         } catch (err) {
             console.error("Failed to fetch pinned", err);
@@ -149,7 +238,30 @@ const ChatWindow = ({ user }) => {
         e.preventDefault();
         if (!newGroupName.trim()) return;
         try {
-            await api.post('/groups', { name: newGroupName });
+            const inviteCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+            
+            const { data: newGroup, error: groupError } = await supabase
+                .from('groups')
+                .insert({
+                    name: newGroupName,
+                    created_by: user.id,
+                    invite_code: inviteCode
+                })
+                .select()
+                .single();
+
+            if (groupError) throw groupError;
+
+            // Auto-join group as owner
+            const { error: memberError } = await supabase
+                .from('group_members')
+                .insert({
+                    group_id: newGroup.id,
+                    user_id: user.id
+                });
+
+            if (memberError) throw memberError;
+
             setNewGroupName('');
             setShowCreateGroup(false);
             fetchGroups();
@@ -158,38 +270,58 @@ const ChatWindow = ({ user }) => {
             alert("Failed to create group");
         }
     };
+
     const joinGroup = async (group) => {
         try {
-            // First check the request status
-            const statusRes = await api.get(`/groups/${group.id}/request-status`);
-            const status = statusRes.data.status;
-
-            if (status === 'owner' || status === 'member') {
-                // Already owner or member, proceed normally
+            if (group.created_by === user.id) {
                 setSelectedGroup(group);
-                socket.emit('join_group', group.id);
+                return;
+            }
 
-                const res = await api.get(`/groups/${group.id}/messages`);
-                setMessages(Array.isArray(res.data) ? res.data : []);
-                scrollToBottom();
-            } else if (status === 'pending') {
-                alert('Your request to join this group is pending approval from the owner.');
-            } else if (status === 'rejected') {
-                alert('Your request to join this group was rejected.');
-            } else {
-                // No request yet, create one
-                const joinRes = await api.post(`/groups/${group.id}/join`);
-                if (joinRes.data.status === 'pending') {
+            const { data: isMember, error: memberError } = await supabase
+                .from('group_members')
+                .select('*')
+                .eq('group_id', group.id)
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (memberError) throw memberError;
+
+            if (isMember) {
+                setSelectedGroup(group);
+                return;
+            }
+
+            const { data: existingRequest, error: reqError } = await supabase
+                .from('join_requests')
+                .select('*')
+                .eq('group_id', group.id)
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (reqError) throw reqError;
+
+            if (existingRequest) {
+                if (existingRequest.status === 'pending') {
+                    alert('Your request to join this group is pending approval from the owner.');
+                } else if (existingRequest.status === 'rejected') {
+                    await supabase
+                        .from('join_requests')
+                        .update({ status: 'pending', created_at: new Date().toISOString() })
+                        .eq('id', existingRequest.id);
                     alert('Join request sent! Waiting for owner approval.');
-                } else if (joinRes.data.status === 'approved' || joinRes.data.status === 'already_member') {
-                    // Auto-approved (owner) or already member
+                } else if (existingRequest.status === 'approved') {
                     setSelectedGroup(group);
-                    socket.emit('join_group', group.id);
-
-                    const res = await api.get(`/groups/${group.id}/messages`);
-                    setMessages(Array.isArray(res.data) ? res.data : []);
-                    scrollToBottom();
                 }
+            } else {
+                await supabase
+                    .from('join_requests')
+                    .insert({
+                        group_id: group.id,
+                        user_id: user.id,
+                        status: 'pending'
+                    });
+                alert('Join request sent! Waiting for owner approval.');
             }
         } catch (err) {
             console.error("Failed to join group", err);
@@ -198,11 +330,17 @@ const ChatWindow = ({ user }) => {
     };
 
     const deleteGroup = async (e, groupId) => {
-        e.stopPropagation(); // Prevent joining the group when clicking delete
+        e.stopPropagation();
         if (!window.confirm("Are you sure you want to delete this group?")) return;
 
         try {
-            await api.delete(`/groups/${groupId}`);
+            const { error } = await supabase
+                .from('groups')
+                .delete()
+                .eq('id', groupId);
+
+            if (error) throw error;
+
             setGroups(groups.filter(g => g.id !== groupId));
             if (selectedGroup && selectedGroup.id === groupId) {
                 setSelectedGroup(null);
@@ -217,23 +355,70 @@ const ChatWindow = ({ user }) => {
     const handleJoinByCode = async (e) => {
         e.preventDefault();
         try {
-            const res = await api.post(`/groups/join/${joinCode}`);
-            if (res.data.success) {
-                if (res.data.status === 'pending') {
-                    alert('Join request sent! Waiting for approval.');
-                } else {
-                    alert('Joined group successfully!');
-                    fetchGroups();
-                    if (res.data.group) {
-                        // Optionally auto-select, but fetching groups is safer to get full list
-                    }
-                }
+            const { data: group, error: groupError } = await supabase
+                .from('groups')
+                .select('*')
+                .eq('invite_code', joinCode)
+                .maybeSingle();
+
+            if (groupError) throw groupError;
+            if (!group) {
+                alert("Group not found with this code");
+                return;
+            }
+
+            if (group.created_by === user.id) {
+                await supabase
+                    .from('group_members')
+                    .insert({ group_id: group.id, user_id: user.id })
+                    .skipDuplicates();
+                alert("You are the owner of this group. Joined successfully!");
+                fetchGroups();
                 setShowJoinGroup(false);
                 setJoinCode('');
+                return;
             }
+
+            const { data: isMember } = await supabase
+                .from('group_members')
+                .select('*')
+                .eq('group_id', group.id)
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (isMember) {
+                alert("You are already a member of this group!");
+                setShowJoinGroup(false);
+                setJoinCode('');
+                return;
+            }
+
+            const { data: existingRequest } = await supabase
+                .from('join_requests')
+                .select('*')
+                .eq('group_id', group.id)
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (existingRequest) {
+                if (existingRequest.status === 'approved') {
+                    alert("You are already approved. Joining!");
+                    await supabase.from('group_members').insert({ group_id: group.id, user_id: user.id });
+                } else if (existingRequest.status === 'pending') {
+                    alert("You already have a pending request for this group.");
+                } else {
+                    await supabase.from('join_requests').update({ status: 'pending' }).eq('id', existingRequest.id);
+                    alert("Resubmitted join request!");
+                }
+            } else {
+                await supabase.from('join_requests').insert({ group_id: group.id, user_id: user.id, status: 'pending' });
+                alert('Join request sent! Waiting for owner approval.');
+            }
+            setShowJoinGroup(false);
+            setJoinCode('');
         } catch (err) {
             console.error("Failed to join group:", err);
-            alert(err.response?.data?.error || "Failed to join group");
+            alert("Failed to join group");
         }
     };
 
@@ -243,16 +428,46 @@ const ChatWindow = ({ user }) => {
         }, 100);
     };
 
-    const sendMessage = (type, content) => {
+    const sendMessage = async (type, content, metadata = {}) => {
         if (!selectedGroup) return;
-        socket.emit('send_message', {
-            groupId: selectedGroup.id,
-            userId: user.id,
-            type,
-            content,
-            reply_to_message_id: replyingToMessage ? replyingToMessage.id : null
-        });
-        setReplyingToMessage(null);
+        try {
+            const { error } = await supabase
+                .from('messages')
+                .insert({
+                    group_id: selectedGroup.id,
+                    user_id: user.id,
+                    type,
+                    content,
+                    reply_to_message_id: replyingToMessage ? replyingToMessage.id : null,
+                    ...metadata
+                });
+            if (error) throw error;
+            setReplyingToMessage(null);
+        } catch (err) {
+            console.error('Failed to send message:', err);
+        }
+    };
+
+    const uploadFileToStorage = async (file) => {
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
+        const filePath = `uploads/${fileName}`;
+
+        const { data, error } = await supabase.storage
+            .from('chat-media')
+            .upload(filePath, file);
+
+        if (error) throw error;
+
+        const { data: { publicUrl } } = supabase.storage
+            .from('chat-media')
+            .getPublicUrl(filePath);
+
+        return {
+            url: publicUrl,
+            filename: file.name,
+            filesize: file.size
+        };
     };
 
     const startRecording = async (type) => {
@@ -273,16 +488,14 @@ const ChatWindow = ({ user }) => {
 
             mediaRecorder.onstop = async () => {
                 const blob = new Blob(audioChunksRef.current, { type: type === 'audio' ? 'audio/webm' : 'video/webm' });
-                const formData = new FormData();
-                formData.append('file', blob, `recording.${type === 'audio' ? 'webm' : 'webm'}`);
+                const file = new File([blob], `recording-${Date.now()}.webm`, { type: blob.type });
 
                 try {
-                    const res = await api.post('/upload', formData, {
-                        headers: { 'Content-Type': 'multipart/form-data' }
-                    });
-                    sendMessage(type, res.data.url);
+                    const fileInfo = await uploadFileToStorage(file);
+                    await sendMessage(type, fileInfo.url);
                 } catch (err) {
                     console.error("Upload failed", err);
+                    alert("Upload failed");
                 }
 
                 stream.getTracks().forEach(track => track.stop());
@@ -309,20 +522,52 @@ const ChatWindow = ({ user }) => {
         }
     };
 
-    const startGroupCall = (isVideo) => {
+    const startGroupCall = async (isVideo) => {
         const callId = `call_${Date.now()}`;
-        setActiveCall({ callId, isVideo, groupId: selectedGroup.id, participants: [] });
-        socket.emit('call:initiate', {
+        const callData = {
             callId,
+            isVideo,
             groupId: selectedGroup.id,
-            isVideo
+            callerId: user.id,
+            callerName: user.full_name || user.username,
+            participants: []
+        };
+        
+        // Log to database call history (so it registers in timeline)
+        const { data: dbCall, error: callError } = await supabase
+            .from('call_history')
+            .insert({
+                group_id: selectedGroup.id,
+                caller_id: user.id,
+                call_type: isVideo ? 'video' : 'audio',
+                started_at: new Date().toISOString(),
+                participants: JSON.stringify([])
+            })
+            .select()
+            .single();
+
+        if (callError) {
+            console.error("Failed to start call in db:", callError);
+        }
+
+        const activeCallData = { ...callData, dbCallId: dbCall?.id, participants: [] };
+        setActiveCall(activeCallData);
+
+        // Send broadcast
+        const channel = supabase.channel('calls');
+        await channel.subscribe(async (status) => {
+            if (status === 'SUBSCRIBED') {
+                await channel.send({
+                    type: 'broadcast',
+                    event: 'call:incoming',
+                    payload: activeCallData
+                });
+            }
         });
     };
 
     const acceptCall = () => {
-        const callId = incomingCall.callId;
         setActiveCall({ ...incomingCall, participants: [] });
-        socket.emit('call:join', { callId });
         setIncomingCall(null);
     };
 
@@ -330,7 +575,33 @@ const ChatWindow = ({ user }) => {
         setIncomingCall(null);
     };
 
-    const endCall = () => {
+    const endCall = async () => {
+        // If we were the caller, let's update duration in database
+        if (activeCall && activeCall.callerId === user.id && activeCall.dbCallId) {
+            const startedAt = new Date(activeCall.started_at);
+            const duration = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+            
+            await supabase
+                .from('call_history')
+                .update({
+                    ended_at: new Date().toISOString(),
+                    duration: duration > 0 ? duration : 0
+                })
+                .eq('id', activeCall.dbCallId);
+        }
+        
+        // Broadcast call ended
+        const channel = supabase.channel('calls');
+        await channel.subscribe(async (status) => {
+            if (status === 'SUBSCRIBED') {
+                await channel.send({
+                    type: 'broadcast',
+                    event: 'call:ended',
+                    payload: { callId: activeCall?.callId }
+                });
+            }
+        });
+
         setActiveCall(null);
     };
 
@@ -348,10 +619,28 @@ const ChatWindow = ({ user }) => {
         try {
             switch (action) {
                 case 'react':
-                    await api.post(`/messages/${message.id}/react`, { emoji: data });
-                    // Refresh messages to show new reaction
-                    const res = await api.get(`/groups/${selectedGroup.id}/messages`);
-                    setMessages(Array.isArray(res.data) ? res.data : []);
+                    const { data: existingReaction } = await supabase
+                        .from('message_reactions')
+                        .select('*')
+                        .eq('message_id', message.id)
+                        .eq('user_id', user.id)
+                        .eq('emoji', data)
+                        .maybeSingle();
+
+                    if (existingReaction) {
+                        await supabase
+                            .from('message_reactions')
+                            .delete()
+                            .eq('id', existingReaction.id);
+                    } else {
+                        await supabase
+                            .from('message_reactions')
+                            .insert({
+                                message_id: message.id,
+                                user_id: user.id,
+                                emoji: data
+                            });
+                    }
                     break;
 
                 case 'edit':
@@ -369,33 +658,47 @@ const ChatWindow = ({ user }) => {
 
                 case 'pin':
                     if (message.is_pinned) {
-                        await api.delete(`/features/${selectedGroup.id}/pin/${message.id}`);
+                        await supabase
+                            .from('pinned_messages')
+                            .delete()
+                            .eq('message_id', message.id)
+                            .eq('group_id', selectedGroup.id);
                     } else {
-                        await api.post(`/features/${selectedGroup.id}/pin/${message.id}`);
+                        await supabase
+                            .from('pinned_messages')
+                            .insert({
+                                message_id: message.id,
+                                group_id: selectedGroup.id,
+                                pinned_by: user.id
+                            });
                     }
-                    const resPin = await api.get(`/groups/${selectedGroup.id}/messages`);
-                    setMessages(Array.isArray(resPin.data) ? resPin.data : []);
                     break;
 
                 case 'delete-all':
                     if (confirm('Delete this message for everyone?')) {
-                        await api.delete(`/messages/${message.id}/delete-all`);
-                        // Remove from local state
-                        setMessages(prev => prev.filter(m => m.id !== message.id));
-                        // Notify others via socket
-                        socket.emit('message_deleted', { messageId: message.id, groupId: selectedGroup.id });
+                        await supabase
+                            .from('deleted_messages')
+                            .insert({
+                                message_id: message.id,
+                                user_id: user.id,
+                                deleted_for_all: true
+                            });
                     }
                     break;
 
                 case 'delete-me':
-                    await api.delete(`/messages/${message.id}/delete-me`);
-                    // Remove from local state
-                    setMessages(prev => prev.filter(m => m.id !== message.id));
+                    await supabase
+                        .from('deleted_messages')
+                        .insert({
+                            message_id: message.id,
+                            user_id: user.id,
+                            deleted_for_all: false
+                        });
                     break;
             }
         } catch (err) {
             console.error('Message action failed:', err);
-            alert(err.response?.data?.error || 'Action failed');
+            alert('Action failed');
         }
     };
 
@@ -404,22 +707,26 @@ const ChatWindow = ({ user }) => {
         if (!inputText.trim()) return;
 
         if (editingMessage) {
-            // Edit message
             try {
-                await api.put(`/messages/${editingMessage.id}/edit`, { content: inputText });
-                // Refresh messages
-                const res = await api.get(`/groups/${selectedGroup.id}/messages`);
-                setMessages(Array.isArray(res.data) ? res.data : []);
+                const { error } = await supabase
+                    .from('messages')
+                    .update({
+                        content: inputText,
+                        edit_count: (editingMessage.edit_count || 0) + 1,
+                        edited_at: new Date().toISOString()
+                    })
+                    .eq('id', editingMessage.id);
+
+                if (error) throw error;
+
                 setEditingMessage(null);
                 setInputText('');
-                // Notify others via socket
-                socket.emit('message_edited', { messageId: editingMessage.id, groupId: selectedGroup.id });
             } catch (err) {
-                alert(err.response?.data?.error || 'Failed to edit message');
+                console.error("Failed to edit message:", err);
+                alert('Failed to edit message');
             }
         } else {
-            // Send new message
-            sendMessage('text', inputText);
+            await sendMessage('text', inputText);
             setInputText('');
         }
     };
@@ -433,28 +740,16 @@ const ChatWindow = ({ user }) => {
         const file = e.target.files[0];
         if (!file) return;
 
-        const formData = new FormData();
-        formData.append('file', file);
-
         try {
-            const res = await api.post('/upload', formData, {
-                headers: { 'Content-Type': 'multipart/form-data' }
-            });
-
-            // Determine type based on mime type
+            const fileInfo = await uploadFileToStorage(file);
+            
             let type = 'file';
             if (file.type.startsWith('image/')) type = 'image';
             if (file.type.startsWith('video/')) type = 'video';
 
-            // Send message with metadata
-            if (!selectedGroup) return;
-            socket.emit('send_message', {
-                groupId: selectedGroup.id,
-                userId: user.id,
-                type,
-                content: res.data.url,
-                filename: res.data.originalName,
-                filesize: res.data.size
+            await sendMessage(type, fileInfo.url, {
+                filename: fileInfo.filename,
+                filesize: fileInfo.filesize
             });
 
             setShowAttachments(false);
@@ -488,15 +783,15 @@ const ChatWindow = ({ user }) => {
         const file = e.target.files[0];
         if (!file) return;
 
-        const formData = new FormData();
-        formData.append('file', file);
-
         try {
-            const res = await api.put('/users/profile-pic', formData, {
-                headers: { 'Content-Type': 'multipart/form-data' }
-            });
-            // Update local user object (in a real app, use context or global state)
-            user.profile_pic = res.data.url;
+            const fileInfo = await uploadFileToStorage(file);
+            const { error } = await supabase
+                .from('users')
+                .update({ profile_pic: fileInfo.url })
+                .eq('id', user.id);
+            
+            if (error) throw error;
+            user.profile_pic = fileInfo.url;
             alert("Profile picture updated!");
         } catch (err) {
             console.error("Profile pic upload failed", err);
@@ -506,33 +801,49 @@ const ChatWindow = ({ user }) => {
 
     const handleSaveStatus = async () => {
         try {
-            await api.put('/users/profile-settings', { status: userStatus });
+            const { error } = await supabase
+                .from('users')
+                .update({ status: userStatus })
+                .eq('id', user.id);
+            if (error) throw error;
             user.status = userStatus;
             setShowStatusModal(false);
             alert("Status updated!");
         } catch (err) {
             console.error("Failed to update status:", err);
-            alert(err.response?.data?.error || "Failed to update status");
+            alert("Failed to update status");
         }
     };
 
     const handleSaveEmail = async () => {
         try {
-            await api.put('/users/profile-settings', { email: userEmail });
+            const { error: authError } = await supabase.auth.updateUser({ email: userEmail });
+            if (authError) throw authError;
+
+            const { error } = await supabase
+                .from('users')
+                .update({ email: userEmail })
+                .eq('id', user.id);
+            if (error) throw error;
+
             user.email = userEmail;
             setShowEmailModal(false);
-            alert("Email updated!");
+            alert("Email updated! Please verify it via the verification link sent to your inbox.");
         } catch (err) {
             console.error("Failed to update email:", err);
-            alert(err.response?.data?.error || "Failed to update email");
+            alert(err.message || "Failed to update email");
         }
     };
 
     const handleDeleteAccount = async () => {
         if (confirm('Are you sure you want to delete your account? This action cannot be undone.')) {
             try {
-                await api.delete('/users/me');
-                alert('Account deleted successfully.');
+                const { error } = await supabase
+                    .from('users')
+                    .delete()
+                    .eq('id', user.id);
+                if (error) throw error;
+                await supabase.auth.signOut();
                 window.location.reload();
             } catch (err) {
                 console.error('Failed to delete account:', err);
@@ -788,7 +1099,7 @@ const ChatWindow = ({ user }) => {
                                     📌 Pinned
                                 </button>
                                 <button onClick={() => startGroupCall(false)} className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }} title="Audio Call">
-                                    🎤 Audio Call
+                                    🎙️ Audio Call
                                 </button>
                                 <button onClick={() => startGroupCall(true)} className="btn btn-primary" style={{ padding: '0.5rem 1rem' }} title="Video Call">
                                     📹 Video Call
@@ -810,7 +1121,7 @@ const ChatWindow = ({ user }) => {
                                         opacity: 0.8
                                     }}>
                                         <div style={{ fontSize: '1.5rem' }}>
-                                            {m.call_type === 'video' ? '📹' : '🎤'}
+                                            {m.call_type === 'video' ? '📹' : '🎙️'}
                                         </div>
                                         <div style={{ flex: 1 }}>
                                             <div style={{ fontWeight: 'bold', fontSize: '0.9rem' }}>
@@ -1026,7 +1337,7 @@ const ChatWindow = ({ user }) => {
                                             />
                                             <button type="submit" className="btn btn-primary">{editingMessage ? 'Save' : 'Send'}</button>
                                         </form>
-                                        <button onClick={() => startRecording('audio')} className="btn btn-secondary" title="Record Audio">🎤</button>
+                                        <button onClick={() => startRecording('audio')} className="btn btn-secondary" title="Record Audio">🎙️</button>
                                         <button onClick={() => startRecording('video')} className="btn btn-secondary" title="Record Video">📹</button>
                                     </>
                                 ) : (
@@ -1097,7 +1408,7 @@ const ChatWindow = ({ user }) => {
                 }}>
                     <div className="card animate-scale-in" style={{ padding: '2rem', textAlign: 'center', maxWidth: '400px' }}>
                         <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>
-                            {incomingCall.isVideo ? '📹' : '🎤'}
+                            {incomingCall.isVideo ? '📹' : '🎙️'}
                         </div>
                         <h2 style={{ marginBottom: '0.5rem' }}>{incomingCall.callerName}</h2>
                         <p style={{ color: 'var(--text-secondary)', marginBottom: '2rem' }}>
@@ -1226,7 +1537,7 @@ const ChatWindow = ({ user }) => {
                     <div className="card animate-scale-in" style={{ padding: '2rem', maxWidth: '500px', width: '90%', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
                             <h2 style={{ margin: 0 }}>📌 Pinned Messages</h2>
-                            <button onClick={() => setShowPinnedModal(false)} className="btn btn-secondary" style={{ padding: '0.2rem 0.5rem' }}>✕</button>
+                            <button onClick={() => setShowPinnedModal(false)} className="btn btn-secondary" style={{ padding: '0.2rem 0.5rem' }}>✖</button>
                         </div>
                         <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                             {pinnedMessages.length === 0 ? (

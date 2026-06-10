@@ -5,6 +5,7 @@ import Signup from './components/Signup';
 import ChatWindow from './components/ChatWindow';
 import AdminPanel from './components/AdminPanel';
 import JoinRequests from './components/JoinRequests';
+import { supabase } from './supabaseClient';
 
 function App() {
     const [user, setUser] = useState(null);
@@ -12,38 +13,42 @@ function App() {
     const navigate = useNavigate();
 
     useEffect(() => {
-        // Check for existing session with daily expiration
-        const checkSession = () => {
-            const token = localStorage.getItem('token');
-            const userStr = localStorage.getItem('user');
-            const loginDate = localStorage.getItem('loginDate');
-
-            if (token && userStr && loginDate) {
-                const today = new Date().toDateString();
-
-                // Check if login is from today
-                if (loginDate === today) {
-                    // Session is still valid for today
-                    const userData = JSON.parse(userStr);
-                    setUser(userData);
+        const checkUser = async (session) => {
+            if (session?.user) {
+                // Fetch public profile from our table
+                const { data, error } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('auth_id', session.user.id)
+                    .single();
+                
+                if (data) {
+                    setUser(data);
                 } else {
-                    // Session expired (new day), clear storage
-                    localStorage.removeItem('token');
-                    localStorage.removeItem('user');
-                    localStorage.removeItem('loginDate');
+                    // Fallback if public profile isn't ready
+                    setUser({ id: session.user.id, email: session.user.email, username: session.user.user_metadata?.username, is_admin: 0 });
                 }
+            } else {
+                setUser(null);
             }
             setLoading(false);
         };
 
-        checkSession();
-    }, []); // Only run once on mount
+        // Check active session immediately
+        supabase.auth.getSession().then(({ data: { session } }) => {
+            checkUser(session);
+        });
 
-    const handleLogout = () => {
-        localStorage.removeItem('token');
-        localStorage.removeItem('user');
-        localStorage.removeItem('loginDate');
-        setUser(null);
+        // Listen for auth changes
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+            checkUser(session);
+        });
+
+        return () => subscription.unsubscribe();
+    }, []);
+
+    const handleLogout = async () => {
+        await supabase.auth.signOut();
         navigate('/login');
     };
 
@@ -80,7 +85,7 @@ function App() {
                                 <span>{user.full_name || user.username} {user.is_admin === 1 && <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--accent-primary)', padding: '0.1rem 0.4rem', borderRadius: '1rem' }}>Admin</span>}</span>
                                 <button onClick={() => navigate('/')} className="btn btn-secondary">Chat</button>
                                 <button onClick={() => navigate('/requests')} className="btn btn-secondary">Join Requests</button>
-                                {user.is_admin && <button onClick={() => navigate('/admin')} className="btn btn-secondary">Admin Dashboard</button>}
+                                {user.is_admin === 1 && <button onClick={() => navigate('/admin')} className="btn btn-secondary">Admin Dashboard</button>}
                                 <button onClick={handleLogout} className="btn btn-danger" style={{ padding: '0.25rem 0.75rem', fontSize: '0.875rem' }}>Logout</button>
                             </div>
                         </header>
@@ -92,7 +97,7 @@ function App() {
                             <Route path="/signup" element={!user ? <Signup setUser={setUser} /> : <Navigate to="/" />} />
                             <Route path="/" element={user ? <ChatWindow user={user} /> : <Navigate to="/login" />} />
                             <Route path="/requests" element={user ? <JoinRequests user={user} /> : <Navigate to="/login" />} />
-                            <Route path="/admin" element={user && user.is_admin ? <AdminPanel /> : <Navigate to="/" />} />
+                            <Route path="/admin" element={user && user.is_admin === 1 ? <AdminPanel /> : <Navigate to="/" />} />
                         </Routes>
                     </main>
                 </>

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import api from '../api';
+import { supabase } from '../supabaseClient';
 
 const ForwardModal = ({ message, onClose, groups }) => {
     const [selectedGroups, setSelectedGroups] = useState([]);
@@ -21,10 +21,16 @@ const ForwardModal = ({ message, onClose, groups }) => {
 
         setLoading(true);
         try {
-            await api.post(`/features/${message.group_id}/forward`, {
-                messageId: message.id,
-                targetGroupIds: selectedGroups
-            });
+            const inserts = selectedGroups.map(groupId => ({
+                group_id: groupId,
+                user_id: message.user_id,
+                type: message.type,
+                content: message.content,
+                filename: message.filename,
+                filesize: message.filesize,
+                forwarded: true
+            }));
+            await supabase.from('messages').insert(inserts);
             alert(`Message forwarded to ${selectedGroups.length} group(s)`);
             onClose();
         } catch (err) {
@@ -38,10 +44,7 @@ const ForwardModal = ({ message, onClose, groups }) => {
     return (
         <div style={{
             position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
+            top: 0, left: 0, right: 0, bottom: 0,
             backgroundColor: 'rgba(0,0,0,0.7)',
             display: 'flex',
             alignItems: 'center',

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import api from '../api';
+import { supabase } from '../supabaseClient';
 
 const JoinRequests = ({ user }) => {
     const [requests, setRequests] = useState([]);
@@ -11,8 +11,32 @@ const JoinRequests = ({ user }) => {
 
     const fetchRequests = async () => {
         try {
-            const res = await api.get('/groups/requests/pending');
-            setRequests(res.data);
+            // Get groups owned by this user
+            const { data: ownedGroups } = await supabase
+                .from('groups')
+                .select('id')
+                .eq('created_by', user.id);
+
+            const groupIds = (ownedGroups || []).map(g => g.id);
+            if (groupIds.length === 0) {
+                setRequests([]);
+                setLoading(false);
+                return;
+            }
+
+            const { data } = await supabase
+                .from('join_requests')
+                .select('*, users(username, full_name), groups(name)')
+                .in('group_id', groupIds)
+                .eq('status', 'pending');
+
+            const formatted = (data || []).map(r => ({
+                ...r,
+                username: r.users?.username,
+                full_name: r.users?.full_name,
+                group_name: r.groups?.name
+            }));
+            setRequests(formatted);
             setLoading(false);
         } catch (err) {
             console.error('Failed to fetch requests');
@@ -22,8 +46,13 @@ const JoinRequests = ({ user }) => {
 
     const handleApprove = async (requestId) => {
         try {
-            await api.post(`/groups/requests/${requestId}/approve`);
-            fetchRequests(); // Refresh list
+            const request = requests.find(r => r.id === requestId);
+            await supabase.from('join_requests').update({ status: 'approved' }).eq('id', requestId);
+            // Add user to group members
+            if (request) {
+                await supabase.from('group_members').insert({ group_id: request.group_id, user_id: request.user_id });
+            }
+            fetchRequests();
         } catch (err) {
             alert('Failed to approve request');
         }
@@ -31,8 +60,8 @@ const JoinRequests = ({ user }) => {
 
     const handleReject = async (requestId) => {
         try {
-            await api.post(`/groups/requests/${requestId}/reject`);
-            fetchRequests(); // Refresh list
+            await supabase.from('join_requests').update({ status: 'rejected' }).eq('id', requestId);
+            fetchRequests();
         } catch (err) {
             alert('Failed to reject request');
         }

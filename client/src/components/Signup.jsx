@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import api from '../api';
+import { supabase } from '../supabaseClient';
 
 const Signup = ({ setUser }) => {
     const [formData, setFormData] = useState({
@@ -17,7 +17,6 @@ const Signup = ({ setUser }) => {
 
     const handleChange = (e) => {
         const { name, value, type, checked } = e.target;
-        // Clean username and email: only lowercase
         let val = type === 'checkbox' ? checked : value;
         if (name === 'email') {
             val = value.toLowerCase();
@@ -38,17 +37,14 @@ const Signup = ({ setUser }) => {
             setError("Username must be at least 3 characters");
             return;
         }
-
         if (formData.password !== formData.confirmPassword) {
             setError("Passwords don't match");
             return;
         }
-
         if (formData.password.length < 6) {
             setError("Password must be at least 6 characters");
             return;
         }
-
         if (!formData.consent) {
             setError("You must agree to the Terms of Use");
             return;
@@ -56,22 +52,38 @@ const Signup = ({ setUser }) => {
 
         setLoading(true);
         try {
-            const res = await api.post('/auth/signup', {
-                fullName: formData.fullName.trim(),
-                username: formData.username.trim(),
+            const { data, error: signUpError } = await supabase.auth.signUp({
                 email: formData.email.trim(),
-                password: formData.password
+                password: formData.password,
+                options: {
+                    data: {
+                        username: formData.username.trim(),
+                        full_name: formData.fullName.trim(),
+                    }
+                }
             });
 
-            const today = new Date().toDateString();
-            localStorage.setItem('token', res.data.token);
-            localStorage.setItem('user', JSON.stringify(res.data.user));
-            localStorage.setItem('loginDate', today);
+            if (signUpError) throw signUpError;
 
-            setUser(res.data.user);
+            // Wait a moment for the database trigger to create the public.users record
+            await new Promise(r => setTimeout(r, 500));
+
+            const { data: userData, error: userError } = await supabase
+                .from('users')
+                .select('*')
+                .eq('auth_id', data.user.id)
+                .single();
+                
+            if (userError) {
+                console.error("Error fetching user profile:", userError);
+                // Fallback to basic user info if public profile isn't ready
+                setUser({ id: data.user.id, email: data.user.email, username: formData.username.trim(), full_name: formData.fullName.trim(), is_admin: 0 });
+            } else {
+                setUser(userData);
+            }
             navigate('/');
         } catch (err) {
-            setError(err.response?.data?.error || err.message || 'Registration failed');
+            setError(err.message || 'Registration failed');
         } finally {
             setLoading(false);
         }
