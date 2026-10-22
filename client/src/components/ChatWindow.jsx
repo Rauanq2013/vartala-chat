@@ -5,6 +5,74 @@ import MessageContextMenu from './MessageContextMenu';
 import ReplyPreview from './ReplyPreview';
 import ForwardModal from './ForwardModal';
 
+// Web Audio API Ringtone Generator (works across all browsers/devices without external files)
+let audioCtx = null;
+let ringtoneTimer = null;
+
+const playBeepTone = () => {
+    try {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        osc.frequency.setValueAtTime(480, audioCtx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.55);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.6);
+    } catch (e) {
+        console.warn("AudioContext error:", e);
+    }
+};
+
+const startRingtone = () => {
+    stopRingtone();
+    playBeepTone();
+    ringtoneTimer = setInterval(playBeepTone, 1800);
+};
+
+const stopRingtone = () => {
+    if (ringtoneTimer) {
+        clearInterval(ringtoneTimer);
+        ringtoneTimer = null;
+    }
+};
+
+const triggerSystemNotification = (title, body) => {
+    try {
+        if ('Notification' in window) {
+            if (Notification.permission === 'granted') {
+                const notif = new Notification(title, {
+                    body,
+                    icon: '/assets/logo.jpg',
+                    tag: 'incoming-call',
+                    requireInteraction: true
+                });
+                notif.onclick = () => {
+                    window.focus();
+                    notif.close();
+                };
+            } else if (Notification.permission === 'default') {
+                Notification.requestPermission().then(perm => {
+                    if (perm === 'granted') {
+                        new Notification(title, { body, icon: '/assets/logo.jpg', tag: 'incoming-call' });
+                    }
+                });
+            }
+        }
+    } catch (e) {
+        console.warn("Notification error:", e);
+    }
+};
+
 const ChatWindow = ({ user }) => {
     const [groups, setGroups] = useState([]);
     const [selectedGroup, setSelectedGroup] = useState(null);
@@ -40,48 +108,137 @@ const ChatWindow = ({ user }) => {
     const messagesEndRef = useRef(null);
     const videoPreviewRef = useRef(null);
     const streamRef = useRef(null);
+    const callChannelRef = useRef(null);
+
+    const onIncomingCall = (callData) => {
+        setIncomingCall(callData);
+        startRingtone();
+        triggerSystemNotification(
+            `Incoming ${callData.isVideo ? 'Video' : 'Audio'} Call`,
+            `${callData.callerName} is calling you on Vartala... Click to answer!`
+        );
+    };
 
     useEffect(() => {
         fetchGroups();
 
-        // Listen for incoming calls on Realtime Broadcast
-        const callChannel = supabase.channel('calls')
-            .on('broadcast', { event: 'call:incoming' }, (payload) => {
-                setIncomingCall(payload.payload);
+        // Ask for browser notification permission on first load
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+
+        // 1. Listen for calls on Realtime Broadcast
+        const callChannel = supabase.channel('calls', {
+            config: { broadcast: { ack: true } }
+        });
+        callChannelRef.current = callChannel;
+
+        callChannel
+            .on('broadcast', { event: 'call:incoming' }, (event) => {
+                const payload = event.payload || event;
+                if (payload && payload.callerId !== user.id) {
+                    onIncomingCall(payload);
+                }
             })
+            .on('broadcast', { event: 'call:ended' }, (event) => {
+                const payload = event.payload || event;
+                if (payload && incomingCall && incomingCall.callId === payload.callId) {
+                    setIncomingCall(null);
+                    stopRingtone();
+                }
+            })
+            .subscribe();
+
+        // 2. Dual fallback: Listen for INSERT on call_history table in real-time
+        const dbCallsChannel = supabase.channel('db-call-signals')
+            .on(
+                'postgres_changes',
+                { event: 'INSERT', schema: 'public', table: 'call_history' },
+                async (payload) => {
+                    const newCall = payload.new;
+                    if (newCall && newCall.caller_id !== user.id && !newCall.ended_at) {
+                        const elapsedSeconds = (Date.now() - new Date(newCall.started_at).getTime()) / 1000;
+                        if (elapsedSeconds < 45) {
+                            const { data: callerUser } = await supabase
+                                .from('users')
+                                .select('username, full_name')
+                                .eq('id', newCall.caller_id)
+                                .single();
+
+                            onIncomingCall({
+                                callId: `call_${newCall.id}`,
+                                dbCallId: newCall.id,
+                                isVideo: newCall.call_type === 'video',
+                                groupId: newCall.group_id,
+                                callerId: newCall.caller_id,
+                                callerName: callerUser?.full_name || callerUser?.username || 'Friend',
+                                participants: []
+                            });
+                        }
+                    }
+                }
+            )
             .subscribe();
 
         return () => {
             supabase.removeChannel(callChannel);
+            supabase.removeChannel(dbCallsChannel);
+            stopRingtone();
         };
-    }, []);
+    }, [user.id]);
 
     const fetchMessages = async (groupId) => {
         try {
             // 1. Fetch messages with relations joined
-            const { data: messagesData, error: messagesError } = await supabase
+            let messagesData = [];
+            const { data, error: messagesError } = await supabase
                 .from('messages')
                 .select(`
                     *,
-                    users(username, full_name, profile_pic),
+                    users:users!messages_user_id_fkey(username, full_name, profile_pic),
                     message_reactions(emoji, user_id),
                     pinned_messages(id),
                     deleted_messages(deleted_for_all, user_id),
-                    reply_to:messages!reply_to_message_id(id, content, users(username, full_name))
+                    reply_to:messages!reply_to_message_id(id, content, users:users!messages_user_id_fkey(username, full_name))
                 `)
                 .eq('group_id', groupId)
                 .order('created_at', { ascending: true });
 
-            if (messagesError) throw messagesError;
+            if (messagesError) {
+                console.warn("Relational messages query error, falling back to direct query:", messagesError);
+                const { data: fallbackData } = await supabase
+                    .from('messages')
+                    .select('*')
+                    .eq('group_id', groupId)
+                    .order('created_at', { ascending: true });
+
+                if (fallbackData && fallbackData.length > 0) {
+                    const userIds = [...new Set(fallbackData.map(m => m.user_id))];
+                    const { data: authors } = await supabase.from('users').select('id, username, full_name, profile_pic').in('id', userIds);
+                    const authorsMap = (authors || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+                    messagesData = fallbackData.map(m => ({ ...m, users: authorsMap[m.user_id] }));
+                } else {
+                    messagesData = fallbackData || [];
+                }
+            } else {
+                messagesData = data || [];
+            }
 
             // 2. Fetch call history for group
-            const { data: callHistoryData, error: callError } = await supabase
-                .from('call_history')
-                .select('*, users!caller_id(username, full_name)')
-                .eq('group_id', groupId)
-                .order('started_at', { ascending: true });
+            let callHistoryData = [];
+            try {
+                const { data: calls, error: callError } = await supabase
+                    .from('call_history')
+                    .select('*, users:users!caller_id(username, full_name)')
+                    .eq('group_id', groupId)
+                    .order('started_at', { ascending: true });
 
-            if (callError) throw callError;
+                if (!callError && calls) {
+                    callHistoryData = calls;
+                }
+            } catch (ce) {
+                console.warn("Call history fetch warning:", ce);
+            }
 
             // Format messages
             const formattedMessages = (messagesData || []).map(m => {
@@ -97,8 +254,8 @@ const ChatWindow = ({ user }) => {
 
                 return {
                     ...m,
-                    username: m.users?.username,
-                    full_name: m.users?.full_name,
+                    username: m.users?.username || 'Unknown',
+                    full_name: m.users?.full_name || m.users?.username || 'Unknown',
                     profile_pic: m.users?.profile_pic,
                     reactions,
                     is_deleted: isDeleted,
@@ -116,8 +273,8 @@ const ChatWindow = ({ user }) => {
             // Format calls
             const formattedCalls = (callHistoryData || []).map(ch => ({
                 ...ch,
-                username: ch.users?.username,
-                full_name: ch.users?.full_name,
+                username: ch.users?.username || 'Unknown',
+                full_name: ch.users?.full_name || ch.users?.username || 'Unknown',
                 category: 'call_history',
                 created_at: ch.started_at
             }));
@@ -523,62 +680,97 @@ const ChatWindow = ({ user }) => {
     };
 
     const startGroupCall = async (isVideo) => {
+        if (!selectedGroup) return;
+
         const callId = `call_${Date.now()}`;
         const callData = {
             callId,
             isVideo,
             groupId: selectedGroup.id,
+            groupName: selectedGroup.name,
             callerId: user.id,
             callerName: user.full_name || user.username,
             participants: []
         };
         
-        // Log to database call history (so it registers in timeline)
-        const { data: dbCall, error: callError } = await supabase
-            .from('call_history')
-            .insert({
-                group_id: selectedGroup.id,
-                caller_id: user.id,
-                call_type: isVideo ? 'video' : 'audio',
-                started_at: new Date().toISOString(),
-                participants: JSON.stringify([])
-            })
-            .select()
-            .single();
+        let dbCallId = null;
+        try {
+            // Log to database call history (registers in timeline and triggers real-time signal)
+            const { data: dbCall, error: callError } = await supabase
+                .from('call_history')
+                .insert({
+                    group_id: selectedGroup.id,
+                    caller_id: user.id,
+                    call_type: isVideo ? 'video' : 'audio',
+                    started_at: new Date().toISOString(),
+                    participants: JSON.stringify([])
+                })
+                .select()
+                .single();
 
-        if (callError) {
-            console.error("Failed to start call in db:", callError);
+            if (dbCall) dbCallId = dbCall.id;
+        } catch (err) {
+            console.error("Failed to start call in db:", err);
         }
 
-        const activeCallData = { ...callData, dbCallId: dbCall?.id, participants: [] };
-        setActiveCall(activeCallData);
+        const activeCallData = { ...callData, dbCallId, participants: [] };
 
-        // Send broadcast
-        const channel = supabase.channel('calls');
-        await channel.subscribe(async (status) => {
-            if (status === 'SUBSCRIBED') {
-                await channel.send({
+        // Send broadcast first
+        if (callChannelRef.current) {
+            try {
+                await callChannelRef.current.send({
                     type: 'broadcast',
                     event: 'call:incoming',
                     payload: activeCallData
                 });
+            } catch (broadcastErr) {
+                console.warn("Call broadcast send error:", broadcastErr);
             }
-        });
+        }
+
+        setActiveCall(activeCallData);
     };
 
     const acceptCall = () => {
-        setActiveCall({ ...incomingCall, participants: [] });
-        setIncomingCall(null);
+        stopRingtone();
+        if (incomingCall) {
+            if (!selectedGroup || selectedGroup.id !== incomingCall.groupId) {
+                const targetGroup = groups.find(g => g.id === incomingCall.groupId);
+                if (targetGroup) setSelectedGroup(targetGroup);
+            }
+            setActiveCall({ ...incomingCall, participants: [] });
+            setIncomingCall(null);
+        }
     };
 
     const rejectCall = () => {
+        stopRingtone();
+        if (incomingCall && callChannelRef.current) {
+            callChannelRef.current.send({
+                type: 'broadcast',
+                event: 'call:ended',
+                payload: { callId: incomingCall.callId }
+            });
+        }
         setIncomingCall(null);
     };
 
     const endCall = async () => {
-        // If we were the caller, let's update duration in database
+        stopRingtone();
+        if (callChannelRef.current && activeCall) {
+            try {
+                await callChannelRef.current.send({
+                    type: 'broadcast',
+                    event: 'call:ended',
+                    payload: { callId: activeCall.callId }
+                });
+            } catch (e) {
+                console.warn("End call broadcast error:", e);
+            }
+        }
+
         if (activeCall && activeCall.callerId === user.id && activeCall.dbCallId) {
-            const startedAt = new Date(activeCall.started_at);
+            const startedAt = new Date(activeCall.started_at || Date.now());
             const duration = Math.floor((Date.now() - startedAt.getTime()) / 1000);
             
             await supabase
@@ -589,20 +781,10 @@ const ChatWindow = ({ user }) => {
                 })
                 .eq('id', activeCall.dbCallId);
         }
-        
-        // Broadcast call ended
-        const channel = supabase.channel('calls');
-        await channel.subscribe(async (status) => {
-            if (status === 'SUBSCRIBED') {
-                await channel.send({
-                    type: 'broadcast',
-                    event: 'call:ended',
-                    payload: { callId: activeCall?.callId }
-                });
-            }
-        });
-
         setActiveCall(null);
+        if (selectedGroup) {
+            fetchMessages(selectedGroup.id);
+        }
     };
 
     const handleMessageRightClick = (e, message) => {
@@ -853,7 +1035,7 @@ const ChatWindow = ({ user }) => {
     };
 
     if (activeCall) {
-        return <CallWindow callId={activeCall.callId} isVideo={activeCall.isVideo} onEnd={endCall} participants={activeCall.participants} />;
+        return <CallWindow callId={activeCall.callId} isVideo={activeCall.isVideo} onEnd={endCall} participants={activeCall.participants} user={user} />;
     }
 
     return (
@@ -1108,8 +1290,8 @@ const ChatWindow = ({ user }) => {
                         </div>
 
                         <div style={{ flex: 1, overflowY: 'auto', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                            {messages.filter(m => m.type === 'message' ? !m.is_deleted : true).map((m, i) => (
-                                m.type === 'call_history' ? (
+                            {messages.filter(m => m.category === 'message' ? !m.is_deleted : true).map((m, i) => (
+                                m.category === 'call_history' ? (
                                     // Render call history
                                     <div key={i} style={{
                                         padding: '0.75rem',
@@ -1400,26 +1582,73 @@ const ChatWindow = ({ user }) => {
                     left: 0,
                     right: 0,
                     bottom: 0,
-                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+                    backdropFilter: 'blur(8px)',
                     display: 'flex',
                     justifyContent: 'center',
                     alignItems: 'center',
-                    zIndex: 1000
+                    zIndex: 9999,
+                    padding: '1rem'
                 }}>
-                    <div className="card animate-scale-in" style={{ padding: '2rem', textAlign: 'center', maxWidth: '400px' }}>
-                        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>
+                    <div className="card animate-scale-in" style={{
+                        padding: '2.5rem 2rem',
+                        textAlign: 'center',
+                        maxWidth: '420px',
+                        width: '100%',
+                        backgroundColor: 'var(--bg-secondary)',
+                        border: '2px solid var(--accent-primary)',
+                        borderRadius: 'var(--radius-lg)',
+                        boxShadow: '0 20px 40px rgba(0, 0, 0, 0.6), 0 0 35px rgba(99, 102, 241, 0.35)'
+                    }}>
+                        <div style={{
+                            width: '84px',
+                            height: '84px',
+                            borderRadius: '50%',
+                            backgroundColor: 'rgba(99, 102, 241, 0.15)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            margin: '0 auto 1.5rem',
+                            fontSize: '2.75rem',
+                            boxShadow: '0 0 20px rgba(99, 102, 241, 0.25)'
+                        }}>
                             {incomingCall.isVideo ? '📹' : '🎙️'}
                         </div>
-                        <h2 style={{ marginBottom: '0.5rem' }}>{incomingCall.callerName}</h2>
-                        <p style={{ color: 'var(--text-secondary)', marginBottom: '2rem' }}>
-                            Incoming {incomingCall.isVideo ? 'video' : 'audio'} call
+                        <h2 style={{ fontSize: '1.625rem', fontWeight: '700', marginBottom: '0.5rem', color: 'var(--text-primary)' }}>
+                            {incomingCall.callerName}
+                        </h2>
+                        <p style={{ color: 'var(--accent-primary)', fontSize: '1rem', fontWeight: '600', marginBottom: '2rem' }}>
+                            Incoming {incomingCall.isVideo ? 'Video' : 'Audio'} Call...
                         </p>
-                        <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
-                            <button onClick={acceptCall} className="btn btn-primary" style={{ padding: '0.75rem 2rem' }}>
-                                Accept
+                        <div style={{ display: 'flex', gap: '1.25rem', justifyContent: 'center' }}>
+                            <button
+                                onClick={acceptCall}
+                                className="btn btn-primary"
+                                style={{
+                                    padding: '0.875rem 2rem',
+                                    fontSize: '1rem',
+                                    backgroundColor: 'var(--success)',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    cursor: 'pointer'
+                                }}
+                            >
+                                <span>📞</span> Accept
                             </button>
-                            <button onClick={rejectCall} className="btn btn-danger" style={{ padding: '0.75rem 2rem' }}>
-                                Decline
+                            <button
+                                onClick={rejectCall}
+                                className="btn btn-danger"
+                                style={{
+                                    padding: '0.875rem 2rem',
+                                    fontSize: '1rem',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    cursor: 'pointer'
+                                }}
+                            >
+                                <span>✕</span> Decline
                             </button>
                         </div>
                     </div>
