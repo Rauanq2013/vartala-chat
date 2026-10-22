@@ -66,6 +66,12 @@ const Signup = ({ setUser }) => {
 
             if (signUpError) throw signUpError;
 
+            // If email already exists, Supabase returns an empty identities array
+            if (data?.user?.identities && data.user.identities.length === 0) {
+                setError('This email is already registered. Please click "Log in" below to sign in.');
+                return;
+            }
+
             // If email confirmation is required, Supabase returns user without active session
             if (data?.user && !data.session) {
                 setEmailSent(true);
