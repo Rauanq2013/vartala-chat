@@ -295,33 +295,101 @@ const ChatWindow = ({ user }) => {
         if (!selectedGroup) return;
 
         fetchMessages(selectedGroup.id);
+        const groupId = selectedGroup.id;
 
-        // Subscribe to Postgres changes on messages and related tables for realtime updates
-        const channel = supabase.channel(`group-chat-${selectedGroup.id}`)
-            .on(
-                'postgres_changes',
-                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'messages' },
-                () => { fetchMessages(selectedGroup.id); }
+        // Realtime subscription: react to every change immediately
+        const channel = supabase.channel(`group-chat-${groupId}`, {
+            config: { broadcast: { self: true } }
+        })
+            .on('postgres_changes',
+                { event: 'INSERT', filter: `group_id=eq.${groupId}`, schema: 'public', table: 'messages' },
+                async (payload) => {
+                    const newMsg = payload.new;
+                    // Fetch the author info for the new message
+                    const { data: author } = await supabase
+                        .from('users')
+                        .select('id, username, full_name, profile_pic')
+                        .eq('id', newMsg.user_id)
+                        .single();
+
+                    const formatted = {
+                        ...newMsg,
+                        username: author?.username || 'Unknown',
+                        full_name: author?.full_name || author?.username || 'Unknown',
+                        profile_pic: author?.profile_pic || null,
+                        reactions: [],
+                        is_deleted: false,
+                        is_pinned: false,
+                        reply_to: null,
+                        category: 'message',
+                        message_reactions: [],
+                        pinned_messages: [],
+                        deleted_messages: [],
+                    };
+
+                    setMessages(prev => {
+                        // Avoid duplicates
+                        if (prev.some(m => m.id === formatted.id && m.category === 'message')) return prev;
+                        const updated = [...prev, formatted].sort((a, b) =>
+                            new Date(a.created_at) - new Date(b.created_at)
+                        );
+                        return updated;
+                    });
+                    setTimeout(() => scrollToBottom(), 50);
+                }
             )
-            .on(
-                'postgres_changes',
-                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'pinned_messages' },
-                () => { fetchMessages(selectedGroup.id); }
+            .on('postgres_changes',
+                { event: 'UPDATE', filter: `group_id=eq.${groupId}`, schema: 'public', table: 'messages' },
+                (payload) => {
+                    setMessages(prev => prev.map(m =>
+                        m.id === payload.new.id && m.category === 'message'
+                            ? { ...m, ...payload.new }
+                            : m
+                    ));
+                }
             )
-            .on(
-                'postgres_changes',
-                { event: '*', schema: 'public', table: 'deleted_messages' },
-                () => { fetchMessages(selectedGroup.id); }
-            )
-            .on(
-                'postgres_changes',
+            .on('postgres_changes',
                 { event: '*', schema: 'public', table: 'message_reactions' },
-                () => { fetchMessages(selectedGroup.id); }
+                () => { fetchMessages(groupId); }
             )
-            .on(
-                'postgres_changes',
-                { event: '*', filter: `group_id=eq.${selectedGroup.id}`, schema: 'public', table: 'call_history' },
-                () => { fetchMessages(selectedGroup.id); }
+            .on('postgres_changes',
+                { event: '*', schema: 'public', table: 'deleted_messages' },
+                () => { fetchMessages(groupId); }
+            )
+            .on('postgres_changes',
+                { event: '*', filter: `group_id=eq.${groupId}`, schema: 'public', table: 'pinned_messages' },
+                () => { fetchMessages(groupId); }
+            )
+            .on('postgres_changes',
+                { event: 'INSERT', filter: `group_id=eq.${groupId}`, schema: 'public', table: 'call_history' },
+                async (payload) => {
+                    const ch = payload.new;
+                    const { data: caller } = await supabase
+                        .from('users').select('username, full_name').eq('id', ch.caller_id).single();
+                    const formatted = {
+                        ...ch,
+                        username: caller?.username || 'Unknown',
+                        full_name: caller?.full_name || caller?.username || 'Unknown',
+                        category: 'call_history',
+                        created_at: ch.started_at
+                    };
+                    setMessages(prev => {
+                        if (prev.some(m => m.id === ch.id && m.category === 'call_history')) return prev;
+                        return [...prev, formatted].sort((a, b) =>
+                            new Date(a.created_at) - new Date(b.created_at)
+                        );
+                    });
+                }
+            )
+            .on('postgres_changes',
+                { event: 'UPDATE', filter: `group_id=eq.${groupId}`, schema: 'public', table: 'call_history' },
+                (payload) => {
+                    setMessages(prev => prev.map(m =>
+                        m.id === payload.new.id && m.category === 'call_history'
+                            ? { ...m, ...payload.new, created_at: payload.new.started_at }
+                            : m
+                    ));
+                }
             )
             .subscribe();
 
