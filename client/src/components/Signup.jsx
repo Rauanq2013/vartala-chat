@@ -13,6 +13,7 @@ const Signup = ({ setUser }) => {
     });
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
+    const [emailSent, setEmailSent] = useState(false);
     const navigate = useNavigate();
 
     const handleChange = (e) => {
@@ -65,29 +66,110 @@ const Signup = ({ setUser }) => {
 
             if (signUpError) throw signUpError;
 
-            // Wait a moment for the database trigger to create the public.users record
-            await new Promise(r => setTimeout(r, 500));
-
-            const { data: userData, error: userError } = await supabase
-                .from('users')
-                .select('*')
-                .eq('auth_id', data.user.id)
-                .single();
-                
-            if (userError) {
-                console.error("Error fetching user profile:", userError);
-                // Fallback to basic user info if public profile isn't ready
-                setUser({ id: data.user.id, email: data.user.email, username: formData.username.trim(), full_name: formData.fullName.trim(), is_admin: 0 });
-            } else {
-                setUser(userData);
+            // If email confirmation is required, Supabase returns user without active session
+            if (data?.user && !data.session) {
+                setEmailSent(true);
+                return;
             }
-            navigate('/');
+
+            // If session is immediately active (e.g., auto-confirm enabled)
+            if (data?.user) {
+                await new Promise(r => setTimeout(r, 500));
+
+                let { data: userData } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('auth_id', data.user.id)
+                    .single();
+                    
+                if (!userData) {
+                    const { data: insertedUser } = await supabase
+                        .from('users')
+                        .upsert({
+                            auth_id: data.user.id,
+                            email: data.user.email,
+                            username: formData.username.trim(),
+                            full_name: formData.fullName.trim(),
+                            is_admin: 0
+                        }, { onConflict: 'auth_id' })
+                        .select()
+                        .single();
+                    userData = insertedUser;
+                }
+
+                if (userData) {
+                    setUser(userData);
+                } else {
+                    setUser({ id: data.user.id, email: data.user.email, username: formData.username.trim(), full_name: formData.fullName.trim(), is_admin: 0 });
+                }
+                navigate('/');
+            }
         } catch (err) {
             setError(err.message || 'Registration failed');
         } finally {
             setLoading(false);
         }
     };
+
+    if (emailSent) {
+        return (
+            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: '2rem 1rem' }}>
+                <div className="card animate-fade-in" style={{ width: '100%', maxWidth: '440px', padding: '2.5rem', textAlign: 'center' }}>
+                    <div style={{
+                        width: '64px',
+                        height: '64px',
+                        borderRadius: '50%',
+                        backgroundColor: 'rgba(99, 102, 241, 0.15)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        margin: '0 auto 1.5rem',
+                        fontSize: '2rem'
+                    }}>
+                        ✉️
+                    </div>
+                    
+                    <h2 style={{ fontSize: '1.75rem', fontWeight: '700', marginBottom: '0.75rem', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+                        Check Your Email
+                    </h2>
+                    
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.925rem', lineHeight: '1.6', marginBottom: '1.5rem' }}>
+                        We sent a verification link to <br />
+                        <strong style={{ color: 'var(--text-primary)' }}>{formData.email}</strong>
+                    </p>
+
+                    <div style={{ 
+                        backgroundColor: 'var(--bg-secondary)', 
+                        border: '1px solid var(--bg-tertiary)', 
+                        borderRadius: 'var(--radius-md)', 
+                        padding: '1.25rem', 
+                        marginBottom: '1.75rem',
+                        textAlign: 'left',
+                        fontSize: '0.875rem',
+                        color: 'var(--text-secondary)',
+                        lineHeight: '1.6'
+                    }}>
+                        <div style={{ fontWeight: '600', color: 'var(--text-primary)', marginBottom: '0.5rem' }}>Next steps:</div>
+                        1. Open the email from <strong>Vartala</strong>.<br />
+                        2. Click <strong>Confirm your mail</strong> to complete your sign up.<br />
+                        3. Once confirmed, you can close this tab or log in.
+                    </div>
+
+                    <Link to="/login" className="btn btn-primary" style={{ width: '100%', padding: '0.875rem', fontSize: '1rem', textDecoration: 'none', display: 'block', boxSizing: 'border-box', marginBottom: '1.25rem' }}>
+                        Proceed to Login
+                    </Link>
+
+                    <button 
+                        type="button"
+                        onClick={() => setEmailSent(false)} 
+                        style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '0.875rem' }}
+                    >
+                        Entered the wrong email? <span style={{ color: 'var(--accent-primary)', textDecoration: 'underline' }}>Change email</span>
+                    </button>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: '2rem 1rem' }}>

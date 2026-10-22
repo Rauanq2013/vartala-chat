@@ -14,47 +14,65 @@ const Login = ({ setUser }) => {
         setError('');
         setLoading(true);
         try {
-            // First, try to login assuming the username is an email address
-            let { data, error: signInError } = await supabase.auth.signInWithPassword({
-                email: username.trim(),
-                password: password,
-            });
+            const trimmedInput = username.trim();
+            let loginEmail = trimmedInput;
 
-            // If it fails with "Invalid login credentials", check if it's a username instead
-            if (signInError && signInError.message === 'Invalid login credentials') {
-                // Find the user's email by looking up their username in the public.users table
+            // If input does not look like an email, find their email from public.users table
+            if (!loginEmail.includes('@')) {
                 const { data: userData, error: userError } = await supabase
                     .from('users')
                     .select('email')
-                    .ilike('username', username.trim())
+                    .ilike('username', trimmedInput)
                     .single();
 
-                if (!userError && userData && userData.email) {
-                    // Try logging in again with the found email
-                    const retry = await supabase.auth.signInWithPassword({
-                        email: userData.email,
-                        password: password,
-                    });
-                    data = retry.data;
-                    signInError = retry.error;
+                if (!userError && userData?.email) {
+                    loginEmail = userData.email;
+                } else {
+                    throw new Error('No account found with this username. Please use your email or check the username.');
                 }
             }
 
-            if (signInError) throw signInError;
+            let { data, error: signInError } = await supabase.auth.signInWithPassword({
+                email: loginEmail,
+                password: password,
+            });
 
-            // Fetch the public profile
-            const { data: profileData, error: profileError } = await supabase
+            if (signInError) {
+                if (signInError.message.toLowerCase().includes('email not confirmed')) {
+                    throw new Error('Please confirm your email before logging in. Check your inbox or spam folder for the confirmation link.');
+                }
+                throw signInError;
+            }
+
+            // Fetch public profile or create it if missing
+            let { data: profileData } = await supabase
                 .from('users')
                 .select('*')
                 .eq('auth_id', data.user.id)
                 .single();
 
-            if (profileError) {
-                console.error("Error fetching user profile:", profileError);
-                // Fallback to basic user info if public profile isn't ready
-                setUser({ id: data.user.id, email: data.user.email, username: username.trim(), is_admin: 0 });
-            } else {
+            if (!profileData) {
+                const metaUsername = data.user.user_metadata?.username || loginEmail.split('@')[0];
+                const metaFullName = data.user.user_metadata?.full_name || '';
+                const { data: insertedProfile } = await supabase
+                    .from('users')
+                    .upsert({
+                        auth_id: data.user.id,
+                        email: data.user.email,
+                        username: metaUsername,
+                        full_name: metaFullName,
+                        is_admin: 0
+                    }, { onConflict: 'auth_id' })
+                    .select()
+                    .single();
+
+                profileData = insertedProfile;
+            }
+
+            if (profileData) {
                 setUser(profileData);
+            } else {
+                setUser({ id: data.user.id, email: data.user.email, username: trimmedInput, is_admin: 0 });
             }
 
             navigate('/');

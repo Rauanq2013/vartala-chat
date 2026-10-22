@@ -16,12 +16,32 @@ function App() {
         const checkUser = async (session) => {
             if (session?.user) {
                 // Fetch public profile from our table
-                const { data, error } = await supabase
+                let { data, error } = await supabase
                     .from('users')
                     .select('*')
                     .eq('auth_id', session.user.id)
                     .single();
                 
+                // If profile not found, automatically create it from auth metadata
+                if (!data) {
+                    const metaUsername = session.user.user_metadata?.username || session.user.email?.split('@')[0];
+                    const metaFullName = session.user.user_metadata?.full_name || '';
+                    const { data: createdProfile } = await supabase
+                        .from('users')
+                        .upsert({
+                            auth_id: session.user.id,
+                            email: session.user.email,
+                            username: metaUsername,
+                            full_name: metaFullName,
+                            is_admin: 0
+                        }, { onConflict: 'auth_id' })
+                        .select()
+                        .single();
+                    if (createdProfile) {
+                        data = createdProfile;
+                    }
+                }
+
                 if (data) {
                     setUser(data);
                 } else {
